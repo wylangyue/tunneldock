@@ -99,7 +99,7 @@ cd tunneldock
 - 安装 Node.js 26 到用户目录；
 - 配置用户级 npm prefix；
 - 安装 Pi；
-- 下载 otunnel 官方 Linux 预编译二进制；
+- 优先下载并实际运行验证 otunnel 官方 Linux 预编译二进制；若目标 VPS 的 GLIBC 太旧导致无法运行，则自动安装 Rust/build-essential 并在该 VPS 本机源码编译 otunnel；
 - 安装官方 Chappie 0.5.0；
 - 应用 chat-scoped session patch；
 - 写入 Chappie autoCreate 配置；
@@ -107,7 +107,7 @@ cd tunneldock
 - 尝试启用 systemd user linger；
 - 创建 ~/.local/bin/tunneldock。
 
-不需要安装 Rust，也没有桌面运行时依赖。
+正常使用兼容的 otunnel 预编译包时不需要 Rust；只有检测到 GLIBC/动态链接不兼容、需要本机源码编译 otunnel 时，安装器才会自动安装最小 Rust toolchain 和编译依赖。没有任何桌面运行时依赖。
 
 安装后如当前 shell 尚未刷新 PATH：
 
@@ -120,7 +120,7 @@ export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
 推荐交互式输入 API Key，避免 Key 出现在 shell history：
 
 ~~~bash
-tunneldock configure --tunnel-id tunnel_xxxxxxxxx
+configure-chappie-tunnel --tunnel-id tunnel_xxxxxxxxx
 ~~~
 
 终端会安全提示：
@@ -132,7 +132,7 @@ OpenAI Restricted API Key:
 也可以使用已有 Key 文件：
 
 ~~~bash
-tunneldock configure \
+configure-chappie-tunnel \
   --tunnel-id tunnel_xxxxxxxxx \
   --api-key-file ~/.chappie/tunnelkey.txt
 ~~~
@@ -146,12 +146,14 @@ tunneldock configure \
 需要时可换端口：
 
 ~~~bash
-tunneldock configure \
+configure-chappie-tunnel \
   --tunnel-id tunnel_xxxxxxxxx \
   --health-addr 127.0.0.1:18081
 ~~~
 
 配置完成后 service 会自动启动。
+
+> **正确顺序：** `./install.sh` → `configure-chappie-tunnel` → `tunneldock doctor`。安装完成但尚未配置真实 Tunnel ID/API Key 时，`doctor` 会显示 `PENDING`，这表示“配置未完成”，不是组件安装失败。
 
 ---
 
@@ -159,7 +161,8 @@ tunneldock configure \
 
 ~~~bash
 tunneldock install
-tunneldock configure
+configure-chappie-tunnel       # 推荐：配置 Tunnel ID / API Key
+tunneldock configure          # 等价兼容入口
 tunneldock sessions-config
 tunneldock start
 tunneldock stop
@@ -359,6 +362,38 @@ TunnelDock update 会重新安装锁定的 Chappie 版本并重新应用 patch�
 
 升级 Chappie 大版本前，不应盲目把旧 patch 套到新源码；应先验证 patch context 和 session 行为。
 
+## 5. 旧 GLIBC VPS 上 otunnel 预编译包无法运行
+
+otunnel v0.1.4 的 Linux Release 当前提供的是 `*-unknown-linux-gnu` 动态链接二进制，没有 musl/static Linux artifact。某些较老的 Debian/Ubuntu VPS 会出现：
+
+~~~text
+version `GLIBC_2.38' not found
+version `GLIBC_2.39' not found
+~~~
+
+这不是 Tunnel ID 或 API Key 配置错误，而是 Release 构建机的 GLIBC 比目标 VPS 新。
+
+TunnelDock 现在不会只检查“文件下载成功”，而会在安装后真正执行：
+
+~~~bash
+otunnel --version
+~~~
+
+如果预编译包不能运行，会自动：
+
+1. 安装 `build-essential` / `pkg-config`；
+2. 安装或升级用户级 Rust stable（otunnel 0.1.4 使用 Rust 2024 edition，需要 Rust >= 1.85）；
+3. 在当前 VPS 本机执行 `cargo install` 编译 otunnel v0.1.4；
+4. 再次执行 `otunnel --version` 做后置验证。
+
+因为最终二进制是在目标 VPS 本机链接，所以会兼容该 VPS 自己的 GLIBC。
+
+如果希望直接跳过 GitHub 预编译包，可执行：
+
+~~~bash
+TUNNELDOCK_FORCE_OTUNNEL_SOURCE=1 ./install.sh
+~~~
+
 ## 5. npm min-release-age 可能造成 ETARGET
 
 一些加固环境会设置：
@@ -384,7 +419,7 @@ npm_config_min_release_age=0
 
 不会修改用户永久 npm 供应链安全策略。
 
-## 6. tunnel 正运行时不要把 otunnel doctor 的端口冲突当成真实故障
+## 7. tunnel 正运行时不要把 otunnel doctor 的端口冲突当成真实故障
 
 如果 service 已经监听 127.0.0.1:18080，再启动完整 otunnel doctor，诊断进程本身可能尝试绑定同一 health port，并启动第二个 pi --chappie。
 
@@ -403,7 +438,7 @@ mcp_server_reachable FAIL
 - service active → 检查现有 /healthz、/readyz、control-plane poll；
 - service inactive → 执行完整 otunnel doctor --profile chappie --explain。
 
-## 7. health port 真正被其他程序占用
+## 8. health port 真正被其他程序占用
 
 检查：
 
@@ -414,12 +449,12 @@ ss -ltnp | grep 18080
 重新配置：
 
 ~~~bash
-tunneldock configure \
+configure-chappie-tunnel \
   --tunnel-id tunnel_xxxxxxxxx \
   --health-addr 127.0.0.1:18081
 ~~~
 
-## 8. API Key 不要写进仓库、service 或 shell history
+## 9. API Key 不要写进仓库、service 或 shell history
 
 默认凭据文件：
 
@@ -431,7 +466,7 @@ tunneldock configure \
 
 otunnel profile 只使用 file: 引用。不要把真实 Key 写入 README、Git commit、systemd unit 或 chappie.json。
 
-## 9. otunnel named profile 的真实位置
+## 10. otunnel named profile 的真实位置
 
 当前 named profile 默认位于：
 

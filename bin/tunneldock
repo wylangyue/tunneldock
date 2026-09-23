@@ -125,13 +125,63 @@ install_pi() {
 	log "Pi: $(pi --version)"
 }
 
+ensure_rust_for_otunnel() {
+	log "安装 otunnel 源码编译依赖（仅旧 GLIBC fallback 使用）..."
+	if have apt-get; then
+		as_root env DEBIAN_FRONTEND=noninteractive apt-get update -y
+		as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential pkg-config
+	fi
+
+	local need_rustup=0
+	if ! have cargo || ! have rustc; then
+		need_rustup=1
+	else
+		# otunnel 0.1.4 uses Rust edition 2024, stabilized in Rust 1.85.
+		if ! rustc -V | awk '{split($2,v,"."); exit !(v[1] > 1 || (v[1] == 1 && v[2] >= 85))}'; then
+			need_rustup=1
+		fi
+	fi
+
+	if [[ "$need_rustup" -eq 1 ]]; then
+		log "安装用户级 Rust stable toolchain..."
+		curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+			sh -s -- -y --profile minimal --default-toolchain stable
+		export PATH="$HOME/.cargo/bin:$PATH"
+	else
+		log "Rust toolchain 已满足要求: $(rustc --version)"
+	fi
+
+	have cargo || die "Rust 安装结束但找不到 cargo"
+	have rustc || die "Rust 安装结束但找不到 rustc"
+}
+
+install_otunnel_from_source() {
+	ensure_rust_for_otunnel
+	log "在当前 VPS 本机编译 otunnel v$OTUNNEL_VERSION，以兼容本机 GLIBC..."
+	cargo install \
+		--git https://github.com/zetaloop/otunnel.git \
+		--tag "v$OTUNNEL_VERSION" \
+		--locked \
+		--force \
+		--root "$HOME/.local" \
+		otunnel
+	"$HOME/.local/bin/otunnel" --version | grep -q "otunnel $OTUNNEL_VERSION" ||
+		die "otunnel 源码编译完成但运行验证失败"
+	log "otunnel 源码编译安装成功: $("$HOME/.local/bin/otunnel" --version)"
+}
+
 install_otunnel() {
 	if have otunnel && otunnel --version 2>/dev/null | grep -q "otunnel $OTUNNEL_VERSION"; then
 		log "otunnel 已满足要求: $(otunnel --version)"
 		return
 	fi
 
-	local arch target asset url tmp
+	if [[ "${TUNNELDOCK_FORCE_OTUNNEL_SOURCE:-0}" == "1" ]]; then
+		install_otunnel_from_source
+		return
+	fi
+
+	local arch target asset url tmp probe_output
 	arch="$(uname -m)"
 	case "$arch" in
 		x86_64|amd64) target="x86_64-unknown-linux-gnu" ;;
@@ -142,13 +192,27 @@ install_otunnel() {
 	url="https://github.com/zetaloop/otunnel/releases/download/v${OTUNNEL_VERSION}/${asset}"
 	tmp="$(mktemp -d)"
 	trap 'rm -rf "$tmp"' RETURN
-	log "安装 otunnel v$OTUNNEL_VERSION ($target)..."
+	log "尝试安装 otunnel v$OTUNNEL_VERSION 官方预编译包 ($target)..."
 	curl -fL --retry 3 "$url" -o "$tmp/$asset"
 	tar -xzf "$tmp/$asset" -C "$tmp" otunnel
-	install -m 0755 "$tmp/otunnel" "$HOME/.local/bin/otunnel"
+
+	# Never trust extraction alone. Release binaries are GNU-linked and may require
+	# a newer GLIBC than an older Debian/Ubuntu VPS provides.
+	if probe_output="$("$tmp/otunnel" --version 2>&1)" &&
+	   grep -q "otunnel $OTUNNEL_VERSION" <<<"$probe_output"; then
+		install -m 0755 "$tmp/otunnel" "$HOME/.local/bin/otunnel"
+		trap - RETURN
+		rm -rf "$tmp"
+		log "otunnel 预编译包运行验证通过: $(otunnel --version)"
+		return
+	fi
+
+	warn "otunnel 官方预编译包无法在当前 VPS 运行。"
+	[[ -n "${probe_output:-}" ]] && warn "$probe_output"
+	warn "常见原因是目标系统 GLIBC 低于 Release 构建机要求；自动切换为本机源码编译。"
 	trap - RETURN
 	rm -rf "$tmp"
-	log "otunnel: $(otunnel --version)"
+	install_otunnel_from_source
 }
 
 install_chappie() {
@@ -253,7 +317,10 @@ install_all() {
 	install_service
 	mkdir -p "$HOME/.local/bin"
 	ln -sfn "$ROOT_DIR/bin/tunneldock" "$HOME/.local/bin/tunneldock"
-	log "安装完成。下一步运行: tunneldock configure"
+	ln -sfn "$ROOT_DIR/bin/configure-chappie-tunnel" "$HOME/.local/bin/configure-chappie-tunnel"
+	log "安装完成。下一步配置真实 Tunnel ID / API Key："
+	log "  configure-chappie-tunnel"
+	log "配置完成后再运行: tunneldock doctor"
 }
 
 configure_tunnel() {
@@ -266,7 +333,8 @@ configure_tunnel() {
 			--health-addr) health_addr="${2:-}"; shift 2 ;;
 			-h|--help)
 				cat <<'EOF'
-Usage: tunneldock configure [options]
+Usage: configure-chappie-tunnel [options]
+       tunneldock configure [options]
   --tunnel-id ID           OpenAI Tunnel ID
   --api-key KEY            Restricted API key (不推荐写进 shell history)
   --api-key-file PATH      Existing/new key file (default ~/.chappie/tunnelkey.txt)
@@ -278,8 +346,20 @@ EOF
 		esac
 	done
 
-	have otunnel || die "请先运行 tunneldock install"
 	have pi || die "请先运行 tunneldock install"
+
+	# Self-heal an absent or unusable otunnel before touching credentials/profile.
+	# This specifically covers older VPSes where the release binary exists on disk
+	# but cannot start because it requires a newer GLIBC.
+	if ! have otunnel; then
+		warn "未找到 otunnel；自动执行安装。"
+		install_otunnel
+	elif ! otunnel --version >/dev/null 2>&1; then
+		warn "检测到 otunnel 文件，但当前 VPS 无法运行它（常见原因：GLIBC 版本过旧）。"
+		warn "自动切换为当前 VPS 本机源码编译 otunnel。"
+		TUNNELDOCK_FORCE_OTUNNEL_SOURCE=1 install_otunnel
+	fi
+	otunnel --version >/dev/null 2>&1 || die "otunnel 仍无法运行；停止配置以避免生成不可用的 Tunnel service"
 	[[ -n "$tunnel_id" ]] || { read -r -p "OpenAI Tunnel ID: " tunnel_id; }
 	[[ -n "$tunnel_id" ]] || die "Tunnel ID 不能为空"
 
@@ -352,7 +432,7 @@ status_cmd() {
 }
 
 doctor_cmd() {
-	local failed=0 runtime_chappie=""
+	local failed=0 pending=0 runtime_chappie=""
 	runtime_chappie="$(find_chappie_dir 2>/dev/null || true)"
 	check() {
 		local label="$1"; shift
@@ -367,7 +447,7 @@ doctor_cmd() {
 	check "node >= 26" bash -c 'command -v node >/dev/null && [[ $(node -p "Number(process.versions.node.split(\".\")[0])") -ge 26 ]]'
 	check "npm available" command -v npm
 	check "pi available" command -v pi
-	check "otunnel available" command -v otunnel
+	check "otunnel runnable" bash -c 'command -v otunnel >/dev/null && otunnel --version >/dev/null 2>&1'
 	if [[ -n "$runtime_chappie" ]]; then
 		printf 'PASS  Chappie package installed (%s)\n' "$runtime_chappie"
 	else
@@ -381,8 +461,27 @@ doctor_cmd() {
 		failed=1
 	fi
 	check "Chappie autoCreate config" grep -q '"autoCreate"' "$CHAPPIE_CONFIG"
-	check "otunnel profile exists" test -f "$HOME/.config/tunnel-client/chappie.yaml"
-	check "API key file exists" test -s "$KEY_FILE"
+
+	if [[ -f "$HOME/.config/tunnel-client/chappie.yaml" ]]; then
+		printf 'PASS  otunnel profile exists\n'
+	else
+		printf 'PENDING  otunnel profile is not configured yet\n'
+		pending=1
+	fi
+	if [[ -s "$KEY_FILE" ]]; then
+		printf 'PASS  API key file exists\n'
+	else
+		printf 'PENDING  API key file is not configured yet\n'
+		pending=1
+	fi
+
+	if [[ "$pending" -eq 1 ]]; then
+		printf '\nTunnel credentials are not configured yet. Installation can still be healthy.\n'
+		printf 'Next step: configure-chappie-tunnel\n'
+		printf 'Then run: tunneldock doctor\n'
+		return 2
+	fi
+
 	check "systemd service active" systemctl --user is-active --quiet chappie-tunnel.service
 
 	if have loginctl; then
@@ -480,6 +579,7 @@ Environment overrides:
   TUNNELDOCK_PI_VERSION=$PI_VERSION
   TUNNELDOCK_CHAPPIE_VERSION=$CHAPPIE_VERSION
   TUNNELDOCK_OTUNNEL_VERSION=$OTUNNEL_VERSION
+  TUNNELDOCK_FORCE_OTUNNEL_SOURCE=1   # skip release binary; compile on this VPS
 EOF
 }
 

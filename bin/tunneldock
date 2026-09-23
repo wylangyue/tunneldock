@@ -1,0 +1,509 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VERSION="0.1.0"
+NODE_VERSION="${TUNNELDOCK_NODE_VERSION:-26.10.0}"
+PI_VERSION="${TUNNELDOCK_PI_VERSION:-0.87.1}"
+CHAPPIE_VERSION="${TUNNELDOCK_CHAPPIE_VERSION:-0.5.0}"
+OTUNNEL_VERSION="${TUNNELDOCK_OTUNNEL_VERSION:-0.1.4}"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+PATCH_FILE="$ROOT_DIR/patches/chappie-0.5.0-chat-scoped-sessions.patch"
+PI_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+CHAPPIE_DIR="$PI_AGENT_DIR/npm/node_modules/@zetaloop/chappie"
+CHAPPIE_CONFIG="$PI_AGENT_DIR/chappie.json"
+SERVICE_DIR="$HOME/.config/systemd/user"
+SERVICE_FILE="$SERVICE_DIR/chappie-tunnel.service"
+KEY_DIR="$HOME/.chappie"
+KEY_FILE="$KEY_DIR/tunnelkey.txt"
+
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+export npm_config_prefix="$HOME/.npm-global"
+
+log() { printf '[tunneldock] %s\n' "$*"; }
+warn() { printf '[tunneldock] WARNING: %s\n' "$*" >&2; }
+die() { printf '[tunneldock] ERROR: %s\n' "$*" >&2; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+find_chappie_dir() {
+	if [[ -f "$CHAPPIE_DIR/package.json" ]] && grep -q '"name"[[:space:]]*:[[:space:]]*"@zetaloop/chappie"' "$CHAPPIE_DIR/package.json"; then
+		printf '%s\n' "$CHAPPIE_DIR"
+		return 0
+	fi
+	local line candidate
+	while IFS= read -r line; do
+		candidate="${line#"${line%%[![:space:]]*}"}"
+		if [[ "$candidate" == /* && -f "$candidate/package.json" ]] && grep -q '"name"[[:space:]]*:[[:space:]]*"@zetaloop/chappie"' "$candidate/package.json"; then
+			printf '%s\n' "$candidate"
+			return 0
+		fi
+	done < <(pi list 2>/dev/null || true)
+	return 1
+}
+
+as_root() {
+	if [[ "$(id -u)" -eq 0 ]]; then
+		"$@"
+	elif have sudo; then
+		sudo "$@"
+	else
+		die "需要 root 权限执行: $*. 请安装 sudo 或使用 root 运行。"
+	fi
+}
+
+require_linux() {
+	[[ "$(uname -s)" == "Linux" ]] || die "CLI 版 TunnelDock 仅支持 Linux VPS。"
+}
+
+require_systemd_user() {
+	have systemctl || die "找不到 systemctl；当前版本要求 systemd。"
+	systemctl --user show-environment >/dev/null 2>&1 || die "systemd --user 不可用。请使用正常登录用户运行，而不是无 user bus 的临时 shell。"
+}
+
+install_prereqs() {
+	require_linux
+	if have apt-get; then
+		log "安装/确认基础依赖..."
+		as_root env DEBIAN_FRONTEND=noninteractive apt-get update -y
+		as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+			ca-certificates curl git patch python3 xz-utils tar coreutils
+	else
+		for cmd in curl git patch python3 xz tar sha256sum; do
+			have "$cmd" || die "缺少 $cmd，且当前系统不是 apt 系发行版。请手动安装后重试。"
+		done
+	fi
+}
+
+node_major() {
+	node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || printf '0'
+}
+
+install_node() {
+	if have node && [[ "$(node_major)" -ge 26 ]]; then
+		log "Node 已满足要求: $(node --version)"
+	else
+		local arch node_arch base archive tmp target expected
+		arch="$(uname -m)"
+		case "$arch" in
+			x86_64|amd64) node_arch="x64" ;;
+			aarch64|arm64) node_arch="arm64" ;;
+			*) die "暂不支持 Node 自动安装架构: $arch" ;;
+		esac
+		base="node-v${NODE_VERSION}-linux-${node_arch}"
+		archive="${base}.tar.xz"
+		tmp="$(mktemp -d)"
+		trap 'rm -rf "$tmp"' RETURN
+		log "安装 Node.js v$NODE_VERSION ($node_arch)..."
+		curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/${archive}" -o "$tmp/$archive"
+		curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt" -o "$tmp/SHASUMS256.txt"
+		expected="$(awk -v f="$archive" '$2==f {print $1}' "$tmp/SHASUMS256.txt")"
+		[[ -n "$expected" ]] || die "未在 Node SHASUMS256.txt 中找到 $archive"
+		printf '%s  %s\n' "$expected" "$tmp/$archive" | sha256sum -c -
+		mkdir -p "$HOME/.local/opt" "$HOME/.local/bin"
+		target="$HOME/.local/opt/$base"
+		rm -rf "$target"
+		tar -xJf "$tmp/$archive" -C "$HOME/.local/opt"
+		ln -sfn "../opt/$base/bin/node" "$HOME/.local/bin/node"
+		ln -sfn "../opt/$base/bin/npm" "$HOME/.local/bin/npm"
+		ln -sfn "../opt/$base/bin/npx" "$HOME/.local/bin/npx"
+		[[ -e "$HOME/.local/opt/$base/bin/corepack" ]] && ln -sfn "../opt/$base/bin/corepack" "$HOME/.local/bin/corepack"
+		trap - RETURN
+		rm -rf "$tmp"
+	fi
+
+	mkdir -p "$HOME/.npm-global"
+	npm config set prefix "$HOME/.npm-global"
+	log "Node: $(node --version), npm: $(npm --version), prefix: $(npm config get prefix)"
+}
+
+install_pi() {
+	log "安装/更新 Pi coding agent @$PI_VERSION..."
+	npm install -g --ignore-scripts "@earendil-works/pi-coding-agent@$PI_VERSION"
+	have pi || die "Pi 安装结束但 PATH 中找不到 pi"
+	log "Pi: $(pi --version)"
+}
+
+install_otunnel() {
+	if have otunnel && otunnel --version 2>/dev/null | grep -q "otunnel $OTUNNEL_VERSION"; then
+		log "otunnel 已满足要求: $(otunnel --version)"
+		return
+	fi
+
+	local arch target asset url tmp
+	arch="$(uname -m)"
+	case "$arch" in
+		x86_64|amd64) target="x86_64-unknown-linux-gnu" ;;
+		aarch64|arm64) target="aarch64-unknown-linux-gnu" ;;
+		*) die "暂不支持 otunnel 自动安装架构: $arch" ;;
+	esac
+	asset="otunnel-${target}-v${OTUNNEL_VERSION}.tar.gz"
+	url="https://github.com/zetaloop/otunnel/releases/download/v${OTUNNEL_VERSION}/${asset}"
+	tmp="$(mktemp -d)"
+	trap 'rm -rf "$tmp"' RETURN
+	log "安装 otunnel v$OTUNNEL_VERSION ($target)..."
+	curl -fL --retry 3 "$url" -o "$tmp/$asset"
+	tar -xzf "$tmp/$asset" -C "$tmp" otunnel
+	install -m 0755 "$tmp/otunnel" "$HOME/.local/bin/otunnel"
+	trap - RETURN
+	rm -rf "$tmp"
+	log "otunnel: $(otunnel --version)"
+}
+
+install_chappie() {
+	[[ -f "$PATCH_FILE" ]] || die "缺少 Chappie patch: $PATCH_FILE"
+	log "安装 Chappie @$CHAPPIE_VERSION..."
+	if pi list 2>/dev/null | grep -q "npm:@zetaloop/chappie@$CHAPPIE_VERSION"; then
+		pi remove "npm:@zetaloop/chappie@$CHAPPIE_VERSION" >/dev/null || true
+	fi
+	# Chappie 0.5.0 may be newer than a user-wide npm min-release-age policy.
+	# Override only for this pinned package install; do not weaken the user's persistent npm security policy.
+	npm_config_min_release_age=0 pi install "npm:@zetaloop/chappie@$CHAPPIE_VERSION"
+	[[ -d "$CHAPPIE_DIR/src" ]] || die "Chappie 安装目录不存在: $CHAPPIE_DIR"
+
+	if grep -q 'managedSessions' "$CHAPPIE_DIR/src/state.ts" 2>/dev/null &&
+	   grep -q 'autoCreate' "$CHAPPIE_DIR/src/broker.ts" 2>/dev/null; then
+		log "Chappie 会话隔离补丁已存在。"
+	else
+		log "应用 ChatGPT 对话 ↔ 独立 Pi session 补丁..."
+		(
+			cd "$CHAPPIE_DIR"
+			patch --batch --forward -p1 < "$PATCH_FILE"
+		)
+	fi
+
+	grep -q 'managedSessions' "$CHAPPIE_DIR/src/state.ts" || die "Chappie patch 后置验证失败"
+	pi --help | grep -q -- '--chappie' || die "Pi 未加载 Chappie --chappie 扩展"
+}
+
+write_session_config() {
+	local cwd="${1:-$HOME}" prefix="${2:-chatgpt}" idle="${3:-30}"
+	mkdir -p "$PI_AGENT_DIR"
+	python3 - "$CHAPPIE_CONFIG" "$cwd" "$prefix" "$idle" <<'PY'
+import json, os, sys
+path, cwd, prefix, idle = sys.argv[1:]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except FileNotFoundError:
+    data = {}
+if not isinstance(data, dict):
+    raise SystemExit("chappie.json must contain a JSON object")
+data["autoCreate"] = {
+    "cwd": os.path.abspath(os.path.expanduser(cwd)),
+    "namePrefix": prefix,
+    "idleMinutes": float(idle),
+}
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+PY
+	log "会话策略已写入 $CHAPPIE_CONFIG"
+	log "  cwd=$cwd, namePrefix=$prefix, idleMinutes=$idle"
+}
+
+install_service() {
+	require_systemd_user
+	mkdir -p "$SERVICE_DIR"
+	local otunnel_path
+	otunnel_path="$(command -v otunnel)"
+	cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=OpenAI MCP tunnel for Chappie
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=$otunnel_path run --profile chappie
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target
+EOF
+	systemctl --user daemon-reload
+	systemctl --user enable chappie-tunnel.service >/dev/null
+	log "已安装 user service: $SERVICE_FILE"
+
+	if have loginctl; then
+		if [[ "$(id -u)" -eq 0 ]]; then
+			loginctl enable-linger "$USER" 2>/dev/null || warn "无法为 $USER 启用 linger；注销 SSH 后 user service 可能停止。"
+		elif have sudo && sudo -n true >/dev/null 2>&1; then
+			sudo loginctl enable-linger "$USER" || warn "无法启用 linger。"
+		else
+			warn "未自动启用 linger。建议执行: sudo loginctl enable-linger $USER"
+		fi
+	fi
+}
+
+install_all() {
+	install_prereqs
+	install_node
+	install_pi
+	install_otunnel
+	install_chappie
+	write_session_config "${TUNNELDOCK_SESSION_CWD:-$HOME}" "${TUNNELDOCK_SESSION_PREFIX:-chatgpt}" "${TUNNELDOCK_SESSION_IDLE_MINUTES:-30}"
+	install_service
+	mkdir -p "$HOME/.local/bin"
+	ln -sfn "$ROOT_DIR/bin/tunneldock" "$HOME/.local/bin/tunneldock"
+	log "安装完成。下一步运行: tunneldock configure"
+}
+
+configure_tunnel() {
+	local tunnel_id="" api_key="" api_key_file="$KEY_FILE" health_addr="127.0.0.1:18080"
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--tunnel-id) tunnel_id="${2:-}"; shift 2 ;;
+			--api-key) api_key="${2:-}"; shift 2 ;;
+			--api-key-file) api_key_file="${2:-}"; shift 2 ;;
+			--health-addr) health_addr="${2:-}"; shift 2 ;;
+			-h|--help)
+				cat <<'EOF'
+Usage: tunneldock configure [options]
+  --tunnel-id ID           OpenAI Tunnel ID
+  --api-key KEY            Restricted API key (不推荐写进 shell history)
+  --api-key-file PATH      Existing/new key file (default ~/.chappie/tunnelkey.txt)
+  --health-addr ADDR       Health listen addr (default 127.0.0.1:18080)
+EOF
+				return
+				;;
+			*) die "未知 configure 参数: $1" ;;
+		esac
+	done
+
+	have otunnel || die "请先运行 tunneldock install"
+	have pi || die "请先运行 tunneldock install"
+	[[ -n "$tunnel_id" ]] || { read -r -p "OpenAI Tunnel ID: " tunnel_id; }
+	[[ -n "$tunnel_id" ]] || die "Tunnel ID 不能为空"
+
+	if [[ -n "$api_key" ]]; then
+		mkdir -p "$(dirname "$api_key_file")"
+		umask 077
+		printf '%s\n' "$api_key" > "$api_key_file"
+	elif [[ ! -s "$api_key_file" ]]; then
+		read -r -s -p "OpenAI Restricted API Key: " api_key
+		printf '\n'
+		[[ -n "$api_key" ]] || die "API Key 不能为空"
+		mkdir -p "$(dirname "$api_key_file")"
+		umask 077
+		printf '%s\n' "$api_key" > "$api_key_file"
+	fi
+	chmod 600 "$api_key_file"
+
+	log "生成 otunnel profile chappie..."
+	otunnel init \
+		--profile chappie \
+		--tunnel-id "$tunnel_id" \
+		--control-plane-base-url "https://api.openai.com" \
+		--control-plane-api-key-ref "file:$api_key_file" \
+		--mcp-command "pi --chappie" \
+		--health-listen-addr "$health_addr" \
+		--force
+
+	install_service
+	systemctl --user restart chappie-tunnel.service
+	sleep 1
+	systemctl --user is-active --quiet chappie-tunnel.service || {
+		systemctl --user status chappie-tunnel.service --no-pager || true
+		die "chappie-tunnel.service 启动失败"
+	}
+	log "Tunnel 已启动。运行 'tunneldock doctor' 做完整验证。"
+}
+
+configure_sessions() {
+	local cwd="$HOME" prefix="chatgpt" idle="30"
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--cwd) cwd="${2:-}"; shift 2 ;;
+			--name-prefix) prefix="${2:-}"; shift 2 ;;
+			--idle-minutes) idle="${2:-}"; shift 2 ;;
+			*) die "未知 sessions-config 参数: $1" ;;
+		esac
+	done
+	write_session_config "$cwd" "$prefix" "$idle"
+	if systemctl --user is-active --quiet chappie-tunnel.service 2>/dev/null; then
+		systemctl --user restart chappie-tunnel.service
+	fi
+}
+
+service_action() {
+	require_systemd_user
+	local action="$1"
+	systemctl --user "$action" chappie-tunnel.service
+}
+
+status_cmd() {
+	require_systemd_user
+	systemctl --user status chappie-tunnel.service --no-pager || true
+	printf '\nVersions:\n'
+	printf '  Node:     %s\n' "$(node --version 2>/dev/null || echo missing)"
+	printf '  npm:      %s\n' "$(npm --version 2>/dev/null || echo missing)"
+	printf '  Pi:       %s\n' "$(pi --version 2>/dev/null || echo missing)"
+	printf '  otunnel:  %s\n' "$(otunnel --version 2>/dev/null || echo missing)"
+	printf '\nChappie config:\n'
+	[[ -f "$CHAPPIE_CONFIG" ]] && cat "$CHAPPIE_CONFIG" || echo "  missing: $CHAPPIE_CONFIG"
+}
+
+doctor_cmd() {
+	local failed=0 runtime_chappie=""
+	runtime_chappie="$(find_chappie_dir 2>/dev/null || true)"
+	check() {
+		local label="$1"; shift
+		if "$@" >/dev/null 2>&1; then
+			printf 'PASS  %s\n' "$label"
+		else
+			printf 'FAIL  %s\n' "$label"
+			failed=1
+		fi
+	}
+
+	check "node >= 26" bash -c 'command -v node >/dev/null && [[ $(node -p "Number(process.versions.node.split(\".\")[0])") -ge 26 ]]'
+	check "npm available" command -v npm
+	check "pi available" command -v pi
+	check "otunnel available" command -v otunnel
+	if [[ -n "$runtime_chappie" ]]; then
+		printf 'PASS  Chappie package installed (%s)\n' "$runtime_chappie"
+	else
+		printf 'FAIL  Chappie package installed\n'
+		failed=1
+	fi
+	if [[ -n "$runtime_chappie" ]] && grep -q 'managedSessions' "$runtime_chappie/src/state.ts" 2>/dev/null; then
+		printf 'PASS  Chat-scoped session patch\n'
+	else
+		printf 'FAIL  Chat-scoped session patch\n'
+		failed=1
+	fi
+	check "Chappie autoCreate config" grep -q '"autoCreate"' "$CHAPPIE_CONFIG"
+	check "otunnel profile exists" test -f "$HOME/.config/tunnel-client/chappie.yaml"
+	check "API key file exists" test -s "$KEY_FILE"
+	check "systemd service active" systemctl --user is-active --quiet chappie-tunnel.service
+
+	if have loginctl; then
+		local linger
+		linger="$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || true)"
+		if [[ "$linger" == "yes" ]]; then
+			printf 'PASS  systemd user linger enabled\n'
+		else
+			printf 'WARN  systemd user linger disabled (SSH 注销后服务可能停止)\n'
+		fi
+	fi
+
+	if systemctl --user is-active --quiet chappie-tunnel.service 2>/dev/null; then
+		local profile="$HOME/.config/tunnel-client/chappie.yaml" health_addr=""
+		health_addr="$(awk '/^[[:space:]]*listen_addr:/ {print $2; exit}' "$profile" 2>/dev/null || true)"
+		printf '\n--- live tunnel health ---\n'
+		if [[ -n "$health_addr" ]] && otunnel health --url "http://$health_addr" --require-control-plane-poll; then
+			:
+		else
+			failed=1
+		fi
+		printf '\nDeep otunnel doctor is skipped while the service is active to avoid false socket/port conflicts.\n'
+	else
+		printf '\n--- otunnel doctor ---\n'
+		if ! otunnel doctor --profile chappie --explain; then
+			failed=1
+		fi
+	fi
+	return "$failed"
+}
+
+logs_cmd() {
+	require_systemd_user
+	if [[ "${1:-}" == "-f" || "${1:-}" == "--follow" ]]; then
+		journalctl --user -u chappie-tunnel.service -f
+	else
+		journalctl --user -u chappie-tunnel.service -n "${1:-100}" --no-pager
+	fi
+}
+
+sessions_cmd() {
+	local state="$PI_AGENT_DIR/chappie.state.json"
+	[[ -f "$state" ]] || { echo "No Chappie state yet: $state"; return; }
+	python3 - "$state" <<'PY'
+import json, sys
+p = sys.argv[1]
+with open(p, encoding="utf-8") as f:
+    d = json.load(f)
+bindings = d.get("bindings") or {}
+managed = d.get("managedSessions") or {}
+rev = {}
+for chat, sid in bindings.items():
+    rev.setdefault(sid, 0)
+    rev[sid] += 1
+print(f"ChatGPT bindings: {len(bindings)}")
+print(f"Managed Pi sessions: {len(managed)}")
+if managed:
+    print()
+    print("SESSION ID                            BINDINGS  NAME                 CWD")
+    for sid, meta in managed.items():
+        print(f"{sid:36} {rev.get(sid,0):8}  {str(meta.get('name','')):20} {meta.get('cwd','')}")
+PY
+}
+
+update_cmd() {
+	[[ -d "$ROOT_DIR/.git" ]] || die "当前安装不是 Git checkout，无法自动 update。"
+	log "更新 TunnelDock CLI..."
+	git -C "$ROOT_DIR" pull --ff-only
+	install_chappie
+	install_service
+	if systemctl --user is-active --quiet chappie-tunnel.service 2>/dev/null; then
+		systemctl --user restart chappie-tunnel.service
+	fi
+	log "更新完成。"
+}
+
+usage() {
+	cat <<EOF
+TunnelDock CLI v$VERSION
+
+Usage:
+  tunneldock install
+  tunneldock configure [--tunnel-id ID] [--api-key-file PATH] [--health-addr ADDR]
+  tunneldock sessions-config [--cwd PATH] [--name-prefix NAME] [--idle-minutes N]
+  tunneldock start|stop|restart
+  tunneldock status
+  tunneldock doctor
+  tunneldock logs [N|-f]
+  tunneldock sessions
+  tunneldock update
+  tunneldock version
+
+Environment overrides:
+  TUNNELDOCK_NODE_VERSION=$NODE_VERSION
+  TUNNELDOCK_PI_VERSION=$PI_VERSION
+  TUNNELDOCK_CHAPPIE_VERSION=$CHAPPIE_VERSION
+  TUNNELDOCK_OTUNNEL_VERSION=$OTUNNEL_VERSION
+EOF
+}
+
+main() {
+	local cmd="${1:-help}"
+	shift || true
+	case "$cmd" in
+		install) install_all "$@" ;;
+		configure) configure_tunnel "$@" ;;
+		sessions-config) configure_sessions "$@" ;;
+		start) service_action start ;;
+		stop) service_action stop ;;
+		restart) service_action restart ;;
+		status) status_cmd ;;
+		doctor) doctor_cmd ;;
+		logs) logs_cmd "$@" ;;
+		sessions) sessions_cmd ;;
+		update) update_cmd ;;
+		version|-v|--version) echo "tunneldock $VERSION" ;;
+		help|-h|--help) usage ;;
+		*) usage; die "未知命令: $cmd" ;;
+	esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+	main "$@"
+fi

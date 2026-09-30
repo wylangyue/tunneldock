@@ -1,19 +1,28 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 NODE_VERSION="${TUNNELDOCK_NODE_VERSION:-26.10.0}"
-PI_VERSION="${TUNNELDOCK_PI_VERSION:-0.87.1}"
-CHAPPIE_VERSION="${TUNNELDOCK_CHAPPIE_VERSION:-0.5.0}"
-OTUNNEL_VERSION="${TUNNELDOCK_OTUNNEL_VERSION:-0.1.4}"
+PI_VERSION="${TUNNELDOCK_PI_VERSION:-0.99.1}"
+CHAPPIE_VERSION="${TUNNELDOCK_CHAPPIE_VERSION:-1.1.0}"
+OTUNNEL_VERSION="${TUNNELDOCK_OTUNNEL_VERSION:-0.2.0}"
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-PATCH_FILE="$ROOT_DIR/patches/chappie-0.5.0-chat-scoped-sessions.patch"
-PI_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
-CHAPPIE_DIR="$PI_AGENT_DIR/npm/node_modules/@zetaloop/chappie"
-CHAPPIE_CONFIG="$PI_AGENT_DIR/chappie.json"
-SERVICE_DIR="$HOME/.config/systemd/user"
+PATCH_FILE="$ROOT_DIR/patches/chappie-${CHAPPIE_VERSION}-chat-scoped-sessions.patch"
+PATCH_REVISION=1
+CHAPPIE_BUILD_VERSION="$CHAPPIE_VERSION-tunneldock.$PATCH_REVISION"
+PNPM_VERSION=12.4.1
+CONFIG_HELPER="$ROOT_DIR/libexec/tunneldock-config.py"
+CACHE_DIR="$HOME/.local/share/tunneldock"
+CHAPPIE_ARCHIVE="$CACHE_DIR/zetaloop-chappie-${CHAPPIE_BUILD_VERSION}.tgz"
+PROFILE_DIR="${TUNNEL_CLIENT_PROFILE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/tunnel-client}"
+PROFILE_DIR="$(realpath -m -- "$PROFILE_DIR")"
+PROFILE_FILE="$PROFILE_DIR/chappie.yaml"
+PI_AGENT_DIR="$(realpath -m -- "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}")"
+CHAPPIE_DIR="$HOME/.npm-global/lib/node_modules/@zetaloop/chappie"
+CHAPPIE_CONFIG="$HOME/.chappie/config.json"
+SERVICE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 SERVICE_FILE="$SERVICE_DIR/chappie-tunnel.service"
 KEY_DIR="$HOME/.chappie"
 KEY_FILE="$KEY_DIR/tunnelkey.txt"
@@ -27,20 +36,22 @@ die() { printf '[tunneldock] ERROR: %s\n' "$*" >&2; exit 1; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-find_chappie_dir() {
-	if [[ -f "$CHAPPIE_DIR/package.json" ]] && grep -q '"name"[[:space:]]*:[[:space:]]*"@zetaloop/chappie"' "$CHAPPIE_DIR/package.json"; then
-		printf '%s\n' "$CHAPPIE_DIR"
-		return 0
-	fi
-	local line candidate
-	while IFS= read -r line; do
-		candidate="${line#"${line%%[![:space:]]*}"}"
-		if [[ "$candidate" == /* && -f "$candidate/package.json" ]] && grep -q '"name"[[:space:]]*:[[:space:]]*"@zetaloop/chappie"' "$candidate/package.json"; then
-			printf '%s\n' "$candidate"
-			return 0
-		fi
-	done < <(pi list 2>/dev/null || true)
-	return 1
+config_tool() { python3 "$CONFIG_HELPER" "$@"; }
+
+pi_chappie_registered() {
+	pi list | sed 's/^[[:space:]]*//' | grep -Fx "$CHAPPIE_DIR" >/dev/null
+}
+
+require_value() {
+	[[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "参数 $1 需要一个值"
+}
+
+validate_versions() {
+	local value
+	for value in "$NODE_VERSION" "$PI_VERSION" "$CHAPPIE_VERSION" "$OTUNNEL_VERSION"; do
+		[[ "$value" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "版本号必须为 MAJOR.MINOR.PATCH"
+	done
+	[[ "$CHAPPIE_VERSION" == "1.1.0" && -f "$PATCH_FILE" ]] || die "尚未验证 Chappie $CHAPPIE_VERSION 的会话补丁；请使用 1.1.0"
 }
 
 as_root() {
@@ -68,19 +79,20 @@ install_prereqs() {
 		log "安装/确认基础依赖..."
 		as_root env DEBIAN_FRONTEND=noninteractive apt-get update -y
 		as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-			ca-certificates curl git patch python3 xz-utils tar coreutils
+			ca-certificates curl git patch python3 python3-yaml xz-utils tar coreutils
 	else
 		for cmd in curl git patch python3 xz tar sha256sum; do
 			have "$cmd" || die "缺少 $cmd，且当前系统不是 apt 系发行版。请手动安装后重试。"
 		done
 	fi
+	python3 -c 'import yaml' >/dev/null 2>&1 || die "缺少 Python PyYAML；请安装 python3-yaml"
 }
 
 node_major() {
 	node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || printf '0'
 }
 
-install_node() {
+install_node() (
 	if have node && [[ "$(node_major)" -ge 26 ]]; then
 		log "Node 已满足要求: $(node --version)"
 	else
@@ -94,7 +106,7 @@ install_node() {
 		base="node-v${NODE_VERSION}-linux-${node_arch}"
 		archive="${base}.tar.xz"
 		tmp="$(mktemp -d)"
-		trap 'rm -rf "$tmp"' RETURN
+		trap 'rm -rf "$tmp"' EXIT
 		log "安装 Node.js v$NODE_VERSION ($node_arch)..."
 		curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/${archive}" -o "$tmp/$archive"
 		curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt" -o "$tmp/SHASUMS256.txt"
@@ -109,79 +121,70 @@ install_node() {
 		ln -sfn "../opt/$base/bin/npm" "$HOME/.local/bin/npm"
 		ln -sfn "../opt/$base/bin/npx" "$HOME/.local/bin/npx"
 		[[ -e "$HOME/.local/opt/$base/bin/corepack" ]] && ln -sfn "../opt/$base/bin/corepack" "$HOME/.local/bin/corepack"
-		trap - RETURN
+		trap - EXIT
 		rm -rf "$tmp"
 	fi
 
 	mkdir -p "$HOME/.npm-global"
 	npm config set prefix "$HOME/.npm-global"
 	log "Node: $(node --version), npm: $(npm --version), prefix: $(npm config get prefix)"
-}
+)
 
 install_pi() {
 	log "安装/更新 Pi coding agent @$PI_VERSION..."
-	npm install -g --ignore-scripts "@earendil-works/pi-coding-agent@$PI_VERSION"
+	npm_config_min_release_age=0 npm install -g --ignore-scripts --no-audit --no-fund "@earendil-works/pi-coding-agent@$PI_VERSION"
 	have pi || die "Pi 安装结束但 PATH 中找不到 pi"
 	log "Pi: $(pi --version)"
 }
 
 ensure_rust_for_otunnel() {
-	log "安装 otunnel 源码编译依赖（仅旧 GLIBC fallback 使用）..."
+	log "准备 otunnel 本机编译工具链..."
 	if have apt-get; then
-		as_root env DEBIAN_FRONTEND=noninteractive apt-get update -y
-		as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential pkg-config
-	fi
-
-	local need_rustup=0
-	if ! have cargo || ! have rustc; then
-		need_rustup=1
+		as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential pkg-config cmake
 	else
-		# otunnel 0.1.4 uses Rust edition 2024, stabilized in Rust 1.85.
-		if ! rustc -V | awk '{split($2,v,"."); exit !(v[1] > 1 || (v[1] == 1 && v[2] >= 85))}'; then
-			need_rustup=1
+		for cmd in cc make cmake pkg-config; do
+			have "$cmd" || die "源码编译缺少 $cmd，请安装后重试"
+		done
+	fi
+	if ! have rustup; then
+		local rustup_script
+		rustup_script="$(mktemp)"
+		if ! curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o "$rustup_script"; then
+			rm -f "$rustup_script"
+			die "无法下载 rustup"
 		fi
+		sh "$rustup_script" -y --profile minimal --default-toolchain stable
+		rm -f "$rustup_script"
 	fi
-
-	if [[ "$need_rustup" -eq 1 ]]; then
-		log "安装用户级 Rust stable toolchain..."
-		curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
-			sh -s -- -y --profile minimal --default-toolchain stable
-		export PATH="$HOME/.cargo/bin:$PATH"
-	else
-		log "Rust toolchain 已满足要求: $(rustc --version)"
-	fi
-
-	have cargo || die "Rust 安装结束但找不到 cargo"
-	have rustc || die "Rust 安装结束但找不到 rustc"
+	rustup toolchain install stable --profile minimal
 }
 
 install_otunnel_from_source() {
 	ensure_rust_for_otunnel
 	log "在当前 VPS 本机编译 otunnel v$OTUNNEL_VERSION，以兼容本机 GLIBC..."
-	cargo install \
+	cargo +stable install \
 		--git https://github.com/zetaloop/otunnel.git \
 		--tag "v$OTUNNEL_VERSION" \
 		--locked \
 		--force \
 		--root "$HOME/.local" \
 		otunnel
-	"$HOME/.local/bin/otunnel" --version | grep -q "otunnel $OTUNNEL_VERSION" ||
+	"$HOME/.local/bin/otunnel" --version | grep -Fxq "otunnel $OTUNNEL_VERSION" ||
 		die "otunnel 源码编译完成但运行验证失败"
 	log "otunnel 源码编译安装成功: $("$HOME/.local/bin/otunnel" --version)"
 }
 
-install_otunnel() {
-	if have otunnel && otunnel --version 2>/dev/null | grep -q "otunnel $OTUNNEL_VERSION"; then
-		log "otunnel 已满足要求: $(otunnel --version)"
-		return
-	fi
-
+install_otunnel() (
+	mkdir -p "$HOME/.local/bin"
 	if [[ "${TUNNELDOCK_FORCE_OTUNNEL_SOURCE:-0}" == "1" ]]; then
 		install_otunnel_from_source
 		return
 	fi
-
-	local arch target asset url tmp probe_output
+	if have otunnel && otunnel --version 2>/dev/null | grep -Fxq "otunnel $OTUNNEL_VERSION"; then
+		log "otunnel 已满足要求: $(otunnel --version)"
+		return
+	fi
+	local arch target asset url tmp
 	arch="$(uname -m)"
 	case "$arch" in
 		x86_64|amd64) target="x86_64-unknown-linux-gnu" ;;
@@ -191,146 +194,144 @@ install_otunnel() {
 	asset="otunnel-${target}-v${OTUNNEL_VERSION}.tar.gz"
 	url="https://github.com/zetaloop/otunnel/releases/download/v${OTUNNEL_VERSION}/${asset}"
 	tmp="$(mktemp -d)"
-	trap 'rm -rf "$tmp"' RETURN
+	trap 'rm -rf "$tmp"' EXIT
 	log "尝试安装 otunnel v$OTUNNEL_VERSION 官方预编译包 ($target)..."
-	curl -fL --retry 3 "$url" -o "$tmp/$asset"
-	tar -xzf "$tmp/$asset" -C "$tmp" otunnel
-
-	# Never trust extraction alone. Release binaries are GNU-linked and may require
-	# a newer GLIBC than an older Debian/Ubuntu VPS provides.
-	if probe_output="$("$tmp/otunnel" --version 2>&1)" &&
-	   grep -q "otunnel $OTUNNEL_VERSION" <<<"$probe_output"; then
+	if curl -fL --retry 3 "$url" -o "$tmp/$asset" &&
+	   tar -xzf "$tmp/$asset" -C "$tmp" otunnel &&
+	   "$tmp/otunnel" --version 2>/dev/null | grep -Fxq "otunnel $OTUNNEL_VERSION"; then
 		install -m 0755 "$tmp/otunnel" "$HOME/.local/bin/otunnel"
-		trap - RETURN
-		rm -rf "$tmp"
-		log "otunnel 预编译包运行验证通过: $(otunnel --version)"
+		log "otunnel 预编译包运行验证通过。"
 		return
 	fi
-
-	warn "otunnel 官方预编译包无法在当前 VPS 运行。"
-	[[ -n "${probe_output:-}" ]] && warn "$probe_output"
-	warn "常见原因是目标系统 GLIBC 低于 Release 构建机要求；自动切换为本机源码编译。"
-	trap - RETURN
-	rm -rf "$tmp"
+	warn "otunnel 预编译包下载、解压或运行验证失败；切换为本机源码编译。"
 	install_otunnel_from_source
-}
+)
+
+build_chappie() (
+	local tmp
+	tmp="$(mktemp -d)"
+	trap 'rm -rf "$tmp"' EXIT
+	log "从 Chappie v$CHAPPIE_VERSION 构建会话隔离版本..."
+	git clone --quiet --depth 1 --branch "v$CHAPPIE_VERSION" https://github.com/zetaloop/chappie.git "$tmp/source"
+	(
+		cd "$tmp/source"
+		node -e 'if (JSON.parse(require("fs").readFileSync("package.json")).version !== process.argv[1]) process.exit(1)' "$CHAPPIE_VERSION"
+		patch --dry-run --batch --fuzz=0 -p1 < "$PATCH_FILE"
+		patch --batch --fuzz=0 -p1 < "$PATCH_FILE"
+	)
+	# Build the published bundle; npm releases no longer contain src/*.ts.
+	npm_config_min_release_age=0 npm install --prefix "$tmp/tools" --ignore-scripts --no-audit --no-fund "pnpm@$PNPM_VERSION"
+	(
+		cd "$tmp/source"
+		"$tmp/tools/node_modules/.bin/pnpm" install --frozen-lockfile --ignore-scripts --config.minimum-release-age=0
+		node_modules/.bin/tsc --noEmit
+		node --input-type=commonjs - "$CHAPPIE_BUILD_VERSION" <<'JS'
+const fs = require("node:fs");
+const pkg = JSON.parse(fs.readFileSync("package.json"));
+pkg.version = process.argv[2];
+pkg.tunneldock = { chatScopedSessions: 1 };
+fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+JS
+		# cli.js embeds package metadata, so rebuild with the local version.
+		node scripts/build.ts
+		npm pack --ignore-scripts --pack-destination "$tmp" >/dev/null
+	)
+	mkdir -p "$CACHE_DIR"
+	install -m 0600 "$tmp/zetaloop-chappie-${CHAPPIE_BUILD_VERSION}.tgz" "$CHAPPIE_ARCHIVE"
+)
 
 install_chappie() {
-	[[ -f "$PATCH_FILE" ]] || die "缺少 Chappie patch: $PATCH_FILE"
-	log "安装 Chappie @$CHAPPIE_VERSION..."
-	if pi list 2>/dev/null | grep -q "npm:@zetaloop/chappie@$CHAPPIE_VERSION"; then
-		pi remove "npm:@zetaloop/chappie@$CHAPPIE_VERSION" >/dev/null || true
-	fi
-	# Chappie 0.5.0 may be newer than a user-wide npm min-release-age policy.
-	# Override only for this pinned package install; do not weaken the user's persistent npm security policy.
-	npm_config_min_release_age=0 pi install "npm:@zetaloop/chappie@$CHAPPIE_VERSION"
-	[[ -d "$CHAPPIE_DIR/src" ]] || die "Chappie 安装目录不存在: $CHAPPIE_DIR"
-
-	if grep -q 'managedSessions' "$CHAPPIE_DIR/src/state.ts" 2>/dev/null &&
-	   grep -q 'autoCreate' "$CHAPPIE_DIR/src/broker.ts" 2>/dev/null; then
-		log "Chappie 会话隔离补丁已存在。"
-	else
-		log "应用 ChatGPT 对话 ↔ 独立 Pi session 补丁..."
-		(
-			cd "$CHAPPIE_DIR"
-			patch --batch --forward -p1 < "$PATCH_FILE"
-		)
-	fi
-
-	grep -q 'managedSessions' "$CHAPPIE_DIR/src/state.ts" || die "Chappie patch 后置验证失败"
-	pi --help | grep -q -- '--chappie' || die "Pi 未加载 Chappie --chappie 扩展"
+	build_chappie
+	log "安装 Chappie broker 和 Pi 扩展 @$CHAPPIE_BUILD_VERSION..."
+	npm install -g --ignore-scripts --omit=peer --no-audit --no-fund "$CHAPPIE_ARCHIVE"
+	# Remove only Chappie registrations; retain all other Pi extensions.
+	local spec
+	while IFS= read -r spec; do
+		[[ -n "$spec" ]] && pi remove "$spec"
+	done < <(pi list 2>/dev/null | sed -n 's/^[[:space:]]*\(npm:@zetaloop\/chappie[^[:space:]]*\).*/\1/p')
+	pi install "$CHAPPIE_DIR"
+	[[ "$(chappie --version)" == "$CHAPPIE_BUILD_VERSION" ]] || die "Chappie broker 运行验证失败"
+	pi_chappie_registered || die "Pi 未注册 Chappie 扩展"
+	pi --help >/dev/null || die "Pi 扩展加载失败"
 }
 
 write_session_config() {
-	local cwd="${1:-$HOME}" prefix="${2:-chatgpt}" idle="${3:-30}"
-	mkdir -p "$PI_AGENT_DIR"
-	python3 - "$CHAPPIE_CONFIG" "$cwd" "$prefix" "$idle" <<'PY'
-import json, os, sys
-path, cwd, prefix, idle = sys.argv[1:]
-try:
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-except FileNotFoundError:
-    data = {}
-if not isinstance(data, dict):
-    raise SystemExit("chappie.json must contain a JSON object")
-data["autoCreate"] = {
-    "cwd": os.path.abspath(os.path.expanduser(cwd)),
-    "namePrefix": prefix,
-    "idleMinutes": float(idle),
-}
-tmp = path + ".tmp"
-with open(tmp, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2, ensure_ascii=False)
-    f.write("\n")
-os.chmod(tmp, 0o600)
-os.replace(tmp, path)
-PY
+	config_tool sessions-config "$CHAPPIE_CONFIG" "${1:-}" "${2:-}" "${3:-}"
 	log "会话策略已写入 $CHAPPIE_CONFIG"
-	log "  cwd=$cwd, namePrefix=$prefix, idleMinutes=$idle"
+}
+
+migrate_chappie() {
+	config_tool migrate "$KEY_DIR" "$PI_AGENT_DIR"
+	config_tool sessions-default "$CHAPPIE_CONFIG" "${TUNNELDOCK_SESSION_CWD:-$HOME}" "${TUNNELDOCK_SESSION_PREFIX:-chatgpt}" "${TUNNELDOCK_SESSION_IDLE_MINUTES:-30}"
+	config_tool profile-broker "$PROFILE_FILE"
 }
 
 install_service() {
 	require_systemd_user
 	mkdir -p "$SERVICE_DIR"
-	local otunnel_path
-	otunnel_path="$(command -v otunnel)"
-	cat > "$SERVICE_FILE" <<EOF
-[Unit]
-Description=OpenAI MCP tunnel for Chappie
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-Environment=PATH=$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=$otunnel_path run --profile chappie
-Restart=on-failure
-RestartSec=5
-UMask=0077
-
-[Install]
-WantedBy=default.target
-EOF
+	# Escape systemd specifiers and quotes without interpreting shell metacharacters.
+	python3 - "$ROOT_DIR/systemd/chappie-tunnel.service.example" "$SERVICE_FILE" "$(command -v otunnel)" "$HOME" "$PI_AGENT_DIR" "$PROFILE_DIR" <<'PYUNIT'
+from pathlib import Path
+import sys
+source, target, binary, home, agent, profiles = sys.argv[1:]
+def quote(value):
+    if any(c in value for c in "\n\r\0"):
+        raise SystemExit("systemd path contains an unsupported control character")
+    return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%') + '"'
+path = f"{home}/.local/bin:{home}/.npm-global/bin:{home}/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+unit = Path(source).read_text()
+unit = unit.replace('Environment=PATH=%h/.local/bin:%h/.npm-global/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin', 'Environment=' + quote('PATH=' + path))
+unit = unit.replace('ExecStart=%h/.local/bin/otunnel run --profile chappie', 'ExecStart=:' + quote(binary) + ' run --profile chappie --profile-dir ' + quote(profiles))
+unit = unit.replace('UMask=0077', 'UMask=0077\nEnvironment=' + quote('PI_CODING_AGENT_DIR=' + agent))
+Path(target).write_text(unit)
+PYUNIT
 	systemctl --user daemon-reload
 	systemctl --user enable chappie-tunnel.service >/dev/null
 	log "已安装 user service: $SERVICE_FILE"
-
+	local username
+	username="$(id -un)"
 	if have loginctl; then
 		if [[ "$(id -u)" -eq 0 ]]; then
-			loginctl enable-linger "$USER" 2>/dev/null || warn "无法为 $USER 启用 linger；注销 SSH 后 user service 可能停止。"
+			loginctl enable-linger "$username" 2>/dev/null || warn "无法启用 linger。"
 		elif have sudo && sudo -n true >/dev/null 2>&1; then
-			sudo loginctl enable-linger "$USER" || warn "无法启用 linger。"
+			sudo loginctl enable-linger "$username" || warn "无法启用 linger。"
 		else
-			warn "未自动启用 linger。建议执行: sudo loginctl enable-linger $USER"
+			warn "未自动启用 linger。建议执行: sudo loginctl enable-linger $username"
 		fi
 	fi
 }
 
-install_all() {
+install_all() (
+	validate_versions
+	require_linux
+	require_systemd_user
 	install_prereqs
+	local was_active=0
+	if systemctl --user is-active --quiet chappie-tunnel.service; then
+		was_active=1
+		systemctl --user stop chappie-tunnel.service
+	fi
+	trap 'if [[ "$was_active" == 1 ]]; then systemctl --user start chappie-tunnel.service || warn "服务恢复失败，请运行 tunneldock doctor"; fi' EXIT
 	install_node
 	install_pi
 	install_otunnel
 	install_chappie
-	write_session_config "${TUNNELDOCK_SESSION_CWD:-$HOME}" "${TUNNELDOCK_SESSION_PREFIX:-chatgpt}" "${TUNNELDOCK_SESSION_IDLE_MINUTES:-30}"
+	migrate_chappie
 	install_service
 	mkdir -p "$HOME/.local/bin"
 	ln -sfn "$ROOT_DIR/bin/tunneldock" "$HOME/.local/bin/tunneldock"
 	ln -sfn "$ROOT_DIR/bin/configure-chappie-tunnel" "$HOME/.local/bin/configure-chappie-tunnel"
-	log "安装完成。下一步配置真实 Tunnel ID / API Key："
-	log "  configure-chappie-tunnel"
-	log "配置完成后再运行: tunneldock doctor"
-}
+	log "安装/更新完成。配置入口: configure-chappie-tunnel；诊断: tunneldock doctor"
+)
 
 configure_tunnel() {
 	local tunnel_id="" api_key="" api_key_file="$KEY_FILE" health_addr="127.0.0.1:18080"
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
-			--tunnel-id) tunnel_id="${2:-}"; shift 2 ;;
-			--api-key) api_key="${2:-}"; shift 2 ;;
-			--api-key-file) api_key_file="${2:-}"; shift 2 ;;
-			--health-addr) health_addr="${2:-}"; shift 2 ;;
+			--tunnel-id) require_value "$@"; tunnel_id="$2"; shift 2 ;;
+			--api-key) require_value "$@"; api_key="$2"; shift 2 ;;
+			--api-key-file) require_value "$@"; api_key_file="$2"; shift 2 ;;
+			--health-addr) require_value "$@"; health_addr="$2"; shift 2 ;;
 			-h|--help)
 				cat <<'EOF'
 Usage: configure-chappie-tunnel [options]
@@ -346,7 +347,11 @@ EOF
 		esac
 	done
 
-	have pi || die "请先运行 tunneldock install"
+	validate_versions
+	require_systemd_user
+	health_addr="$(config_tool health-address "$health_addr")"
+	api_key_file="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().absolute())' "$api_key_file")"
+	if ! have pi || ! have chappie; then die "请先运行 tunneldock install"; fi
 
 	# Self-heal an absent or unusable otunnel before touching credentials/profile.
 	# This specifically covers older VPSes where the release binary exists on disk
@@ -361,7 +366,7 @@ EOF
 	fi
 	otunnel --version >/dev/null 2>&1 || die "otunnel 仍无法运行；停止配置以避免生成不可用的 Tunnel service"
 	[[ -n "$tunnel_id" ]] || { read -r -p "OpenAI Tunnel ID: " tunnel_id; }
-	[[ -n "$tunnel_id" ]] || die "Tunnel ID 不能为空"
+	[[ "$tunnel_id" =~ ^tunnel_[[:alnum:]_-]+$ ]] || die "Tunnel ID 必须以 tunnel_ 开头，且只包含字母、数字、下划线或连字符"
 
 	if [[ -n "$api_key" ]]; then
 		mkdir -p "$(dirname "$api_key_file")"
@@ -380,13 +385,15 @@ EOF
 	log "生成 otunnel profile chappie..."
 	otunnel init \
 		--profile chappie \
+		--profile-dir "$PROFILE_DIR" \
 		--tunnel-id "$tunnel_id" \
 		--control-plane-base-url "https://api.openai.com" \
 		--control-plane-api-key-ref "file:$api_key_file" \
-		--mcp-command "pi --chappie" \
+		--mcp-command "chappie" \
 		--health-listen-addr "$health_addr" \
 		--force
 
+	migrate_chappie
 	install_service
 	systemctl --user restart chappie-tunnel.service
 	sleep 1
@@ -398,12 +405,13 @@ EOF
 }
 
 configure_sessions() {
-	local cwd="$HOME" prefix="chatgpt" idle="30"
+	local cwd="" prefix="" idle=""
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
-			--cwd) cwd="${2:-}"; shift 2 ;;
-			--name-prefix) prefix="${2:-}"; shift 2 ;;
-			--idle-minutes) idle="${2:-}"; shift 2 ;;
+			--cwd) require_value "$@"; cwd="$2"; shift 2 ;;
+			--name-prefix) require_value "$@"; prefix="$2"; shift 2 ;;
+			--idle-minutes) require_value "$@"; idle="$2"; shift 2 ;;
+			-h|--help) echo "Usage: tunneldock sessions-config [--cwd PATH] [--name-prefix NAME] [--idle-minutes 0..1440]"; return ;;
 			*) die "未知 sessions-config 参数: $1" ;;
 		esac
 	done
@@ -426,136 +434,81 @@ status_cmd() {
 	printf '  Node:     %s\n' "$(node --version 2>/dev/null || echo missing)"
 	printf '  npm:      %s\n' "$(npm --version 2>/dev/null || echo missing)"
 	printf '  Pi:       %s\n' "$(pi --version 2>/dev/null || echo missing)"
+	printf '  Chappie:  %s\n' "$(chappie --version 2>/dev/null || echo missing)"
 	printf '  otunnel:  %s\n' "$(otunnel --version 2>/dev/null || echo missing)"
 	printf '\nChappie config:\n'
-	[[ -f "$CHAPPIE_CONFIG" ]] && cat "$CHAPPIE_CONFIG" || echo "  missing: $CHAPPIE_CONFIG"
+	[[ -f "$CHAPPIE_CONFIG" ]] && echo "  present: $CHAPPIE_CONFIG" || echo "  missing: $CHAPPIE_CONFIG"
 }
 
 doctor_cmd() {
-	local failed=0 pending=0 runtime_chappie=""
-	runtime_chappie="$(find_chappie_dir 2>/dev/null || true)"
+	local failed=0 pending=0 health_url=""
 	check() {
 		local label="$1"; shift
-		if "$@" >/dev/null 2>&1; then
-			printf 'PASS  %s\n' "$label"
-		else
-			printf 'FAIL  %s\n' "$label"
-			failed=1
-		fi
+		if "$@" >/dev/null 2>&1; then printf 'PASS  %s\n' "$label";
+		else printf 'FAIL  %s\n' "$label"; failed=1; fi
 	}
-
-	check "node >= 26" bash -c 'command -v node >/dev/null && [[ $(node -p "Number(process.versions.node.split(\".\")[0])") -ge 26 ]]'
+	check "node >= 26" node -e 'if (Number(process.versions.node.split(".")[0]) < 26) process.exit(1)'
 	check "npm available" command -v npm
-	check "pi available" command -v pi
-	check "otunnel runnable" bash -c 'command -v otunnel >/dev/null && otunnel --version >/dev/null 2>&1'
-	if [[ -n "$runtime_chappie" ]]; then
-		printf 'PASS  Chappie package installed (%s)\n' "$runtime_chappie"
-	else
-		printf 'FAIL  Chappie package installed\n'
-		failed=1
-	fi
-	if [[ -n "$runtime_chappie" ]] && grep -q 'managedSessions' "$runtime_chappie/src/state.ts" 2>/dev/null; then
-		printf 'PASS  Chat-scoped session patch\n'
-	else
-		printf 'FAIL  Chat-scoped session patch\n'
-		failed=1
-	fi
-	check "Chappie autoCreate config" grep -q '"autoCreate"' "$CHAPPIE_CONFIG"
-
-	if [[ -f "$HOME/.config/tunnel-client/chappie.yaml" ]]; then
-		printf 'PASS  otunnel profile exists\n'
-	else
+	check "pi runnable" pi --version
+	check "otunnel runnable" otunnel --version
+	check "Chappie broker runnable" chappie --version
+	check "Pi Chappie extension registered" pi_chappie_registered
+	check "Chat-scoped session build" node --input-type=commonjs -e 'const p = require(process.argv[1]); if (p.version !== process.argv[2] || p.tunneldock?.chatScopedSessions !== 1) process.exit(1)' "$CHAPPIE_DIR/package.json" "$CHAPPIE_BUILD_VERSION"
+	check "Python YAML support" python3 -c 'import yaml'
+	check "Chappie autoCreate config" config_tool validate-sessions "$CHAPPIE_CONFIG"
+	check "systemd user bus" systemctl --user show-environment
+	if [[ ! -f "$PROFILE_FILE" ]]; then
 		printf 'PENDING  otunnel profile is not configured yet\n'
 		pending=1
-	fi
-	if [[ -s "$KEY_FILE" ]]; then
-		printf 'PASS  API key file exists\n'
+	elif health_url="$(config_tool profile-info "$PROFILE_FILE")"; then
+		printf 'PASS  profile and referenced API key metadata\n'
 	else
-		printf 'PENDING  API key file is not configured yet\n'
-		pending=1
+		printf 'FAIL  profile or referenced API key metadata\n'
+		failed=1
 	fi
-
 	if [[ "$pending" -eq 1 ]]; then
-		printf '\nTunnel credentials are not configured yet. Installation can still be healthy.\n'
-		printf 'Next step: configure-chappie-tunnel\n'
-		printf 'Then run: tunneldock doctor\n'
-		return 2
+		printf '\nNext step: configure-chappie-tunnel\n'
+		[[ "$failed" -eq 0 ]] && return 2
+		return 1
 	fi
-
 	check "systemd service active" systemctl --user is-active --quiet chappie-tunnel.service
-
-	if have loginctl; then
-		local linger
-		linger="$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || true)"
-		if [[ "$linger" == "yes" ]]; then
-			printf 'PASS  systemd user linger enabled\n'
-		else
-			printf 'WARN  systemd user linger disabled (SSH 注销后服务可能停止)\n'
-		fi
+	if have loginctl && [[ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)" != yes ]]; then
+		printf 'WARN  systemd user linger disabled (SSH 注销后服务可能停止)\n'
 	fi
-
 	if systemctl --user is-active --quiet chappie-tunnel.service 2>/dev/null; then
-		local profile="$HOME/.config/tunnel-client/chappie.yaml" health_addr=""
-		health_addr="$(awk '/^[[:space:]]*listen_addr:/ {print $2; exit}' "$profile" 2>/dev/null || true)"
-		printf '\n--- live tunnel health ---\n'
-		if [[ -n "$health_addr" ]] && otunnel health --url "http://$health_addr" --require-control-plane-poll; then
-			:
-		else
-			failed=1
-		fi
-		printf '\nDeep otunnel doctor is skipped while the service is active to avoid false socket/port conflicts.\n'
+		if [[ -z "$health_url" ]] || ! otunnel health --url "$health_url" --require-control-plane-poll; then failed=1; fi
 	else
-		printf '\n--- otunnel doctor ---\n'
-		if ! otunnel doctor --profile chappie --explain; then
-			failed=1
-		fi
+		# Upstream doctor may launch the broker: only invoke it on a valid profile.
+		if [[ -n "$health_url" ]] && ! otunnel doctor --profile chappie --profile-dir "$PROFILE_DIR" --explain; then failed=1; fi
 	fi
 	return "$failed"
 }
 
 logs_cmd() {
+	[[ $# -le 1 ]] || die "logs 只接受一个行数或 -f 参数"
 	require_systemd_user
 	if [[ "${1:-}" == "-f" || "${1:-}" == "--follow" ]]; then
 		journalctl --user -u chappie-tunnel.service -f
 	else
+		[[ "${1:-100}" =~ ^[0-9]+$ ]] || die "日志行数必须为非负整数"
 		journalctl --user -u chappie-tunnel.service -n "${1:-100}" --no-pager
 	fi
 }
 
 sessions_cmd() {
-	local state="$PI_AGENT_DIR/chappie.state.json"
-	[[ -f "$state" ]] || { echo "No Chappie state yet: $state"; return; }
-	python3 - "$state" <<'PY'
-import json, sys
-p = sys.argv[1]
-with open(p, encoding="utf-8") as f:
-    d = json.load(f)
-bindings = d.get("bindings") or {}
-managed = d.get("managedSessions") or {}
-rev = {}
-for chat, sid in bindings.items():
-    rev.setdefault(sid, 0)
-    rev[sid] += 1
-print(f"ChatGPT bindings: {len(bindings)}")
-print(f"Managed Pi sessions: {len(managed)}")
-if managed:
-    print()
-    print("SESSION ID                            BINDINGS  NAME                 CWD")
-    for sid, meta in managed.items():
-        print(f"{sid:36} {rev.get(sid,0):8}  {str(meta.get('name','')):20} {meta.get('cwd','')}")
-PY
+	local state="$KEY_DIR/state.json"
+	[[ -f "$state" ]] || state="$PI_AGENT_DIR/chappie.state.json"
+	[[ -f "$state" ]] || { echo "No Chappie state yet"; return; }
+	config_tool sessions "$state"
 }
 
 update_cmd() {
-	[[ -d "$ROOT_DIR/.git" ]] || die "当前安装不是 Git checkout，无法自动 update。"
+	git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "当前安装不是 Git checkout，无法自动 update。"
+	[[ -z "$(git -C "$ROOT_DIR" status --porcelain)" ]] || die "checkout 有未提交改动；请先保存改动再 update。"
 	log "更新 TunnelDock CLI..."
 	git -C "$ROOT_DIR" pull --ff-only
-	install_chappie
-	install_service
-	if systemctl --user is-active --quiet chappie-tunnel.service 2>/dev/null; then
-		systemctl --user restart chappie-tunnel.service
-	fi
-	log "更新完成。"
+	# Re-exec so the new release's pins and installer are used in this update.
+	exec "$ROOT_DIR/bin/tunneldock" install
 }
 
 usage() {
@@ -586,6 +539,12 @@ EOF
 main() {
 	local cmd="${1:-help}"
 	shift || true
+	case "$cmd" in
+		install|start|stop|restart|status|doctor|sessions|update|version|-v|--version)
+			if [[ $# -eq 1 && ( "$1" == --help || "$1" == -h ) ]]; then usage; return; fi
+			[[ $# -eq 0 ]] || die "$cmd 不接受额外参数"
+			;;
+	esac
 	case "$cmd" in
 		install) install_all "$@" ;;
 		configure) configure_tunnel "$@" ;;

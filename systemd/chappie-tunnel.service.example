@@ -9,6 +9,7 @@ Environment=PATH=%h/.local/bin:%h/.npm-global/bin:%h/.cargo/bin:/usr/local/bin:/
 ExecStart=%h/.local/bin/otunnel run --profile chappie
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=15
 UMask=0077
 
 [Install]

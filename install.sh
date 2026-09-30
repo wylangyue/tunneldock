@@ -7,4 +7,4 @@ chmod +x "$ROOT_DIR/bin/tunneldock" "$ROOT_DIR/bin/configure-chappie-tunnel"
 ln -sfn "$ROOT_DIR/bin/tunneldock" "$HOME/.local/bin/tunneldock"
 
 export PATH="$HOME/.local/bin:$PATH"
-exec "$ROOT_DIR/bin/tunneldock" install
+exec "$ROOT_DIR/bin/tunneldock" install "$@"

@@ -1,224 +1,116 @@
 # TunnelDock CLI
 
-面向 Linux VPS / 服务器的 **OpenAI Secure MCP Tunnel + Chappie + Pi** 部署与运维 CLI。
+面向 Linux VPS 的 **OpenAI Secure MCP Tunnel + Chappie + Pi** 部署与运维工具。通过 systemd user service 长期运行 otunnel 和 Chappie，让 ChatGPT 使用服务器上的项目、文件和 shell。
 
-这个仓库是 TunnelDock 的服务器版：**不包含 Tauri、React、桌面 UI、托盘、窗口或桌面打包代码**。目标是在长期在线的 Ubuntu/Debian VPS 上，用 systemd user service 持续运行 otunnel → pi --chappie，让 ChatGPT 稳定访问 VPS 上的项目、文件和 shell。
+## 当前版本与上游对齐
 
-当前已验证并锁定：
+2026-09-30 对照上游发布版本更新：
 
-- Node.js 26.10.0
-- Pi coding agent 0.87.1
-- Chappie 0.5.0 + TunnelDock chat-scoped session patch
-- otunnel 0.1.4
-- Linux x86_64 / aarch64
-- systemd
+| 组件 | 默认版本 | 说明 |
+| --- | --- | --- |
+| TunnelDock | 0.2.0 | Linux CLI |
+| Node.js | 26.10.0 | 已有 Node >= 26 时保留现有版本 |
+| Pi coding agent | 0.99.1 | 已验证实际会话创建、历史恢复及空闲恢复 |
+| Chappie | 1.1.0-tunneldock.1 | 基于官方 1.1.0，保留独立会话补丁 |
+| otunnel | 0.2.0 | 使用官方 Linux GNU release，运行失败时本机编译 |
+| pnpm | 12.4.1 | 仅在临时目录用于构建 Chappie |
 
-默认面向 Ubuntu / Debian。其他 Linux 发行版可以使用 CLI，但基础依赖需要自行准备。
+依据：[Chappie v1.1.0](https://github.com/zetaloop/chappie/releases/tag/v1.1.0)、[配置文档](https://github.com/zetaloop/chappie/blob/v1.1.0/docs/setup.md)、[otunnel v0.2.0](https://github.com/zetaloop/otunnel/releases/tag/v0.2.0)。
 
----
+支持 Linux x86_64 / aarch64；自动安装基础依赖面向 Ubuntu / Debian。当前真实集成测试运行于 Linux aarch64，x86_64 未进行实际部署验证。
 
 ## 架构
 
-~~~text
-ChatGPT
-   |
-OpenAI Secure MCP Tunnel
-   |
-otunnel
-   |
-pi --chappie          <- MCP broker
-   |
-+------------------------------+
-| Pi session A  <- ChatGPT A   |
-| Pi session B  <- ChatGPT B   |
-| Pi session C  <- ChatGPT C   |
-+------------------------------+
-   |
-Linux VPS filesystem / shell / projects
-~~~
+```text
+ChatGPT → OpenAI Secure MCP Tunnel → otunnel → chappie（独立 MCP broker）
+                                                   ├─ Pi session A ↔ ChatGPT A
+                                                   ├─ Pi session B ↔ ChatGPT B
+                                                   └─ Pi session C ↔ ChatGPT C
+```
 
-所有网络连接由 VPS 主动通过 HTTPS 出站建立，不需要公开 MCP HTTP 服务，也不需要额外开放入站端口。
+Chappie 1.x 使用独立的 `chappie` 命令，配置和 broker 状态位于 `~/.chappie`。不再使用 `pi --chappie` 启动 broker。Pi 只负责工作会话，Chappie 扩展通过本机 Unix socket 连接 broker。
 
----
+默认 tunnel 连接由 VPS 主动出站建立，无需开放入站端口。健康探针限制在 loopback 地址，broker 默认不开启 TCP listener。
 
-## 最重要的会话改造
+## 快速部署
 
-官方 Chappie 0.5.0 默认会让一个没有绑定的 ChatGPT 对话选择某个未绑定的在线 Pi session。长期 VPS 使用时，这容易让不同 ChatGPT 对话复用 Pi 上下文，导致 transcript 持续膨胀并增加串任务风险。
-
-TunnelDock 安装 Chappie 0.5.0 后会自动应用：
-
-~~~text
-patches/chappie-0.5.0-chat-scoped-sessions.patch
-~~~
-
-改造后的默认语义：
-
-~~~text
-ChatGPT 对话 A <-> Pi session A
-ChatGPT 对话 B <-> Pi session B
-ChatGPT 对话 C <-> Pi session C
-~~~
-
-行为规则：
-
-1. 新的 ChatGPT 对话第一次调用 Chappie时，自动创建新的 Pi session，并持久保存 conversation ID → session ID 绑定。
-2. 当前 ChatGPT 对话继续交流时，自动使用原 Pi session。
-3. 以后重新打开旧 ChatGPT 对话时，恢复原 session ID 和 Pi transcript。
-4. managed Pi 进程默认空闲 30 分钟后退出，但 session 文件、binding 和历史不会删除；下次访问时按原 ID 自动拉起。
-5. 仍支持显式 sessionId，因此需要时可以有意共享或切换 session。
-
-持久化位置：
-
-~~~text
-~/.pi/agent/chappie.state.json
-~/.pi/agent/sessions/
-~~~
-
-所以 100 个历史 ChatGPT 对话并不意味着 100 个常驻 Pi 进程。
-
----
-
-# 快速部署
-
-## 1. Clone
-
-~~~bash
+```bash
 git clone https://github.com/wylangyue/tunneldock.git
 cd tunneldock
-~~~
-
-## 2. 安装
-
-~~~bash
 ./install.sh
-~~~
-
-安装过程会：
-
-- 安装/检查 Linux 基础工具；
-- 安装 Node.js 26 到用户目录；
-- 配置用户级 npm prefix；
-- 安装 Pi；
-- 优先下载并实际运行验证 otunnel 官方 Linux 预编译二进制；若目标 VPS 的 GLIBC 太旧导致无法运行，则自动安装 Rust/build-essential 并在该 VPS 本机源码编译 otunnel；
-- 安装官方 Chappie 0.5.0；
-- 应用 chat-scoped session patch；
-- 写入 Chappie autoCreate 配置；
-- 安装 systemd user service；
-- 尝试启用 systemd user linger；
-- 创建 ~/.local/bin/tunneldock。
-
-正常使用兼容的 otunnel 预编译包时不需要 Rust；只有检测到 GLIBC/动态链接不兼容、需要本机源码编译 otunnel 时，安装器才会自动安装最小 Rust toolchain 和编译依赖。没有任何桌面运行时依赖。
-
-安装后如当前 shell 尚未刷新 PATH：
-
-~~~bash
 export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
-~~~
-
-## 3. 配置 Tunnel
-
-推荐交互式输入 API Key，避免 Key 出现在 shell history：
-
-~~~bash
 configure-chappie-tunnel --tunnel-id tunnel_xxxxxxxxx
-~~~
+tunneldock doctor
+```
 
-终端会安全提示：
+安装需要可用的 systemd user bus。请通过正常登录用户运行；非 root 用户安装 apt 依赖时需要 sudo。
 
-~~~text
-OpenAI Restricted API Key:
-~~~
+配置命令会隐藏输入 Restricted API Key，不将 Key 写入命令行。使用已有凭据文件：
 
-也可以使用已有 Key 文件：
-
-~~~bash
+```bash
 configure-chappie-tunnel \
   --tunnel-id tunnel_xxxxxxxxx \
-  --api-key-file ~/.chappie/tunnelkey.txt
-~~~
+  --api-key-file ~/.chappie/tunnelkey.txt \
+  --health-addr 127.0.0.1:18080
+```
 
-默认健康探针：
+密钥文件只通过 `file:` 引用写入 otunnel profile，权限设为 0600。相对密钥路径会转为绝对路径；诊断仅检查文件元数据，不读取或显示密钥内容。
 
-~~~text
-127.0.0.1:18080
-~~~
+默认 profile：`~/.config/tunnel-client/chappie.yaml`。支持 `XDG_CONFIG_HOME` 和 `TUNNEL_CLIENT_PROFILE_DIR`；生成的 unit 显式携带 profile 目录，避免交互 shell 与 systemd 使用不同的配置。
 
-需要时可换端口：
+安装步骤：
 
-~~~bash
-configure-chappie-tunnel \
-  --tunnel-id tunnel_xxxxxxxxx \
-  --health-addr 127.0.0.1:18081
-~~~
+1. 检查 Linux、systemd user bus 和版本参数，再准备基础工具、Python/PyYAML、Node、Pi。
+2. 下载 otunnel 预编译包并实际执行版本检查。下载、解压或运行失败时，使用 Rust stable、本机编译器和 CMake 从锁定 tag 编译。
+3. 拉取 Chappie v1.1.0，严格验证并应用补丁，按上游 frozen lockfile 安装构建依赖，执行 TypeScript 检查及 bundle 构建。
+4. 将构建产物以 `1.1.0-tunneldock.1` 安装为全局 broker；Pi 注册同一安装目录的扩展。
+5. 迁移旧配置、broker 状态和 MCP 启动命令，保留原始旧文件及会话 transcript。
+6. 安装 systemd unit 和命令入口，尝试启用 linger。
 
-配置完成后 service 会自动启动。
+构建 archive 保存在 `~/.local/share/tunneldock/`。首次构建会下载上游开发依赖，需要额外磁盘空间及网络；运行时无需 pnpm。只有 otunnel 源码回退需要 Rust/CMake。
 
-> **正确顺序：** `./install.sh` → `configure-chappie-tunnel` → `tunneldock doctor`。安装完成但尚未配置真实 Tunnel ID/API Key 时，`doctor` 会显示 `PENDING`，这表示“配置未完成”，不是组件安装失败。
+尚未配置 tunnel 时，安装不会启动新服务。配置完成后自动启动。已有服务在安装/更新期间停止，完成后恢复；失败时也会尝试恢复，但依赖安装没有完整事务回滚，需要检查诊断结果。
 
----
+## CLI
 
-# CLI 命令
-
-~~~bash
+```bash
 tunneldock install
-configure-chappie-tunnel       # 推荐：配置 Tunnel ID / API Key
-tunneldock configure          # 等价兼容入口
-tunneldock sessions-config
+configure-chappie-tunnel --help
+tunneldock configure --help
+tunneldock sessions-config --help
 tunneldock start
 tunneldock stop
 tunneldock restart
 tunneldock status
 tunneldock doctor
-tunneldock logs
+tunneldock logs           # 最近 100 行
+tunneldock logs 300
 tunneldock logs -f
 tunneldock sessions
 tunneldock update
 tunneldock version
-~~~
+```
 
-查看状态：
+`status` 显示组件版本及配置文件位置，不输出可能包含密码的 Chappie 配置。
 
-~~~bash
-tunneldock status
-~~~
+`doctor` 检查可运行组件、会话补丁构建标识、会话配置、systemd user bus，以及 profile 实际引用的凭据文件。退出码：0 表示通过；1 表示存在故障；2 表示组件检查通过但尚未配置 profile。
 
-完整诊断：
+服务运行时，诊断调用现有健康探针并要求 control-plane poll 成功。服务停止且 profile/凭据检查通过时，才运行完整 `otunnel doctor`，避免启动第二个 broker 导致端口/socket 冲突。服务停止本身仍属于诊断失败。
 
-~~~bash
-tunneldock doctor
-~~~
+## 独立会话与恢复
 
-日志：
+上游默认会选择未绑定的在线会话；TunnelDock 为长期 VPS 使用保留以下语义：
 
-~~~bash
-tunneldock logs
-tunneldock logs 300
-tunneldock logs -f
-~~~
+- 新 ChatGPT 对话首次访问时创建独立的 managed Pi session，并保存 conversation ID → session ID。
+- 同一对话重入、broker 重启或空闲回收后，按原 ID 恢复 Pi transcript。
+- 同一对话的并发首次请求共享一次进程启动。
+- 显式 `sessionId` 仍可切换或共享会话；执行工具的显式目标只影响该次操作，`init` 修改默认绑定。
+- 默认空闲 30 分钟退出进程，保留历史和绑定；正在执行或生成的会话不会被空闲回收。
+- 启动失败可按原绑定重试；调用取消会及时返回，正在共享的启动仍可完成。
 
-查看持久化 ChatGPT/Pi session：
+默认配置位于 `~/.chappie/config.json`：
 
-~~~bash
-tunneldock sessions
-~~~
-
-示例：
-
-~~~text
-ChatGPT bindings: 12
-Managed Pi sessions: 12
-
-SESSION ID                            BINDINGS  NAME                 CWD
-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx        1  chatgpt-xxxxxxxx     /home/user
-~~~
-
----
-
-# 调整 ChatGPT ↔ Pi session 策略
-
-默认配置：
-
-~~~json
+```json
 {
   "autoCreate": {
     "cwd": "/home/<user>",
@@ -226,381 +118,102 @@ xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx        1  chatgpt-xxxxxxxx     /home/user
     "idleMinutes": 30
   }
 }
-~~~
+```
 
-修改：
+修改策略：
 
-~~~bash
-tunneldock sessions-config \
-  --cwd /srv/projects \
-  --name-prefix chatgpt \
-  --idle-minutes 30
-~~~
-
-如果希望 managed Pi session 不因空闲退出：
-
-~~~bash
+```bash
+tunneldock sessions-config --cwd /srv/projects --name-prefix chatgpt --idle-minutes 30
 tunneldock sessions-config --idle-minutes 0
-~~~
+```
 
-长期 VPS 一般建议保留默认空闲回收，让历史 session 留在磁盘，需要时再启动进程。
+cwd 必须存在，idleMinutes 范围为 0..1440；0 禁用空闲回收。只修改传入选项，其余策略及其他 Chappie 配置保留。重复安装/更新也保留已有策略。策略修改后，正在运行的服务会重启。
 
----
+`autoCreate` 仅用于本机 Pi，不能和面向远端 broker 的 `connect` 一起使用。Chappie 官方提供的其他 agent 和跨设备能力见[上游设置](https://github.com/zetaloop/chappie/blob/v1.1.0/docs/setup.md)；TunnelDock 自动部署范围为本机 Pi，会保留已有其他设置。
 
-# systemd
+ChatGPT 分支若获得新的 conversation ID，则创建新的会话；不自动 fork 原 transcript。需要继续已有工作时显式选择原 session ID。
 
-service 位置：
+## 从 0.5.0 部署升级
 
-~~~text
-~/.config/systemd/user/chappie-tunnel.service
-~~~
+在干净的 Git checkout 中执行：
 
-核心命令：
+```bash
+cd ~/tunneldock
+tunneldock update
+```
 
-~~~text
-otunnel run --profile chappie
-~~~
+更新先 `git pull --ff-only`，再执行新版本安装器，更新 Pi、otunnel、Chappie 和 unit；符合要求的现有 Node 保留。有未提交改动时停止更新，避免覆盖本地工作。
 
-MCP target：
+迁移映射：
 
-~~~text
-pi --chappie
-~~~
+| 旧位置/行为 | 新位置/行为 |
+| --- | --- |
+| `~/.pi/agent/chappie.json` | `~/.chappie/config.json` |
+| `~/.pi/agent/chappie.state.json` | `~/.chappie/state.json` |
+| `~/.pi/agent/sessions/` | 保持原位，按原 cwd 和 ID 恢复 |
+| profile 中的 `pi --chappie` | `chappie` |
 
-查看：
+支持 `PI_CODING_AGENT_DIR` 自定义 Pi 目录，unit 和 managed 进程都使用该目录。迁移保留绑定、managedSessions、questions 和未交付结果，并转换旧结果的 chatId 字段。已有新配置优先；同一 ID 的绑定或 managed metadata 冲突时停止迁移。成功后记录 `~/.chappie/tunneldock-migration.json`，后续不会重复导入旧状态。
 
-~~~bash
+旧 JSON 文件保持原位；改写 profile 前保存 `.yaml.pre-1.1.0` 备份。迁移保留其他 MCP channel、健康地址及 profile 设置。
+
+不要直接安装官方 Chappie 覆盖本地 broker。Pi 注册的是本地扩展目录，`pi update` 不会更新该本地扩展；升级请使用 TunnelDock。旧的 0.5.0 patch 仅保留作历史参考，安装器只支持已验证的 1.1.0 patch。
+
+## systemd 与常见故障
+
+unit 默认位于 `~/.config/systemd/user/chappie-tunnel.service`，支持 `XDG_CONFIG_HOME`。参考文件：`systemd/chappie-tunnel.service.example`。
+
+unit 明确设置用户级 PATH、Pi agent 目录及 profile 目录，不依赖 `.bashrc`。使用 `UMask=0077`，失败后自动重启，并留出退出时间以回收 managed Pi。
+
+```bash
 systemctl --user status chappie-tunnel.service
-~~~
+loginctl show-user "$(id -un)" -p Linger
+sudo loginctl enable-linger "$(id -un)"
+```
 
-仓库提供参考 unit：
+linger 未开启时，SSH 注销后服务可能停止。安装器无法自动开启时会给出提示。
 
-~~~text
-systemd/chappie-tunnel.service.example
-~~~
+旧 GLIBC VPS 若不能运行 GNU release：
 
----
-
-# 重要避坑
-
-以下问题来自真实 VPS 部署和调试。
-
-## 1. systemd 不读取 .bashrc
-
-SSH shell 中能运行 node、npm、pi、otunnel，不代表 systemd user service 能找到它们。
-
-常见用户级路径：
-
-~~~text
-~/.npm-global/bin/pi
-~/.local/bin/node
-~/.local/bin/otunnel
-~~~
-
-TunnelDock 生成的 service 会明确设置：
-
-~~~text
-PATH=$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin
-~~~
-
-不要依赖 interactive shell profile。
-
-## 2. SSH 退出后 user service 可能停止
-
-检查：
-
-~~~bash
-loginctl show-user "$USER" -p Linger
-~~~
-
-理想状态：
-
-~~~text
-Linger=yes
-~~~
-
-否则：
-
-~~~bash
-sudo loginctl enable-linger "$USER"
-~~~
-
-TunnelDock 会尽量自动启用；没有免密 sudo 时会明确提示。
-
-## 3. 不要让所有 ChatGPT 对话共用一个 Pi session
-
-旧模式：
-
-~~~text
-Chat A --+
-Chat B --+--> one Pi session
-Chat C --+
-~~~
-
-TunnelDock patch：
-
-~~~text
-Chat A --> Pi A
-Chat B --> Pi B
-Chat C --> Pi C
-~~~
-
-空闲后只回收进程，不删除 session。
-
-## 4. 直接更新 Chappie 可能覆盖 session patch
-
-如果直接运行 pi update，或者重新安装官方 Chappie，上游包可能覆盖本仓库补丁。
-
-恢复：
-
-~~~bash
-cd ~/tunneldock
-tunneldock update
-~~~
-
-TunnelDock update 会重新安装锁定的 Chappie 版本并重新应用 patch。
-
-升级 Chappie 大版本前，不应盲目把旧 patch 套到新源码；应先验证 patch context 和 session 行为。
-
-## 5. 旧 GLIBC VPS 上 otunnel 预编译包无法运行
-
-otunnel v0.1.4 的 Linux Release 当前提供的是 `*-unknown-linux-gnu` 动态链接二进制，没有 musl/static Linux artifact。某些较老的 Debian/Ubuntu VPS 会出现：
-
-~~~text
-version `GLIBC_2.38' not found
-version `GLIBC_2.39' not found
-~~~
-
-这不是 Tunnel ID 或 API Key 配置错误，而是 Release 构建机的 GLIBC 比目标 VPS 新。
-
-TunnelDock 现在不会只检查“文件下载成功”，而会在安装后真正执行：
-
-~~~bash
-otunnel --version
-~~~
-
-如果预编译包不能运行，会自动：
-
-1. 安装 `build-essential` / `pkg-config`；
-2. 安装或升级用户级 Rust stable（otunnel 0.1.4 使用 Rust 2024 edition，需要 Rust >= 1.85）；
-3. 在当前 VPS 本机执行 `cargo install` 编译 otunnel v0.1.4；
-4. 再次执行 `otunnel --version` 做后置验证。
-
-因为最终二进制是在目标 VPS 本机链接，所以会兼容该 VPS 自己的 GLIBC。
-
-如果希望直接跳过 GitHub 预编译包，可执行：
-
-~~~bash
+```bash
 TUNNELDOCK_FORCE_OTUNNEL_SOURCE=1 ./install.sh
-~~~
+```
 
-## 5. npm min-release-age 可能造成 ETARGET
+强制选项即使已有可用 otunnel 也会编译。上游 v0.2.0 发布 Linux GNU artifact，未提供 musl/static Linux artifact；本机编译使用目标系统的链接环境。
 
-一些加固环境会设置：
+健康端口冲突时更换 loopback 端口：
 
-~~~ini
-min-release-age=7
-~~~
+```bash
+configure-chappie-tunnel --tunnel-id tunnel_xxxxxxxxx --health-addr 127.0.0.1:18081
+```
 
-如果固定版本发布不足 7 天，npm 可能返回：
+固定包安装及 frozen-lockfile 构建临时绕过 release-age 限制，不改写用户持久供应链策略。Chappie 源码升级需要重新移植补丁，不能只修改版本环境变量。
 
-~~~text
-npm error ETARGET
-No matching version found ... with a date before ...
-~~~
+## 验证
 
-这不代表版本不存在。
+本地回归检查：
 
-TunnelDock 只在安装锁定 Chappie 版本这一条命令上临时设置：
+```bash
+bash -n bin/tunneldock bin/configure-chappie-tunnel install.sh
+shellcheck bin/tunneldock bin/configure-chappie-tunnel install.sh
+python3 -m unittest discover -s tests -v
+git diff --check
+```
 
-~~~text
-npm_config_min_release_age=0
-~~~
+对 Chappie v1.1.0 应用新 patch 并按其 frozen lockfile 准备依赖后，可运行 broker 回归：
 
-不会修改用户永久 npm 供应链安全策略。
+```bash
+CHAPPIE_SOURCE_DIR=/path/to/patched/chappie node --test tests/chappie.test.mjs
+```
 
-## 7. tunnel 正运行时不要把 otunnel doctor 的端口冲突当成真实故障
+增加真实 Pi 集成测试时，设置 `CHAPPIE_PI_BIN` 为隔离安装的 Pi 0.99.1 可执行文件路径、`CHAPPIE_PACKAGE_DIR` 为已构建安装的 Chappie 包目录。测试只在临时目录运行，涵盖独立对话、并发、共享、失败重试、取消、空闲回收、忙碌保护和 transcript 恢复。
 
-如果 service 已经监听 127.0.0.1:18080，再启动完整 otunnel doctor，诊断进程本身可能尝试绑定同一 health port，并启动第二个 pi --chappie。
+部署后人工验证：新建 ChatGPT 对话 A/B，确认两个 session ID 不同；返回 A 确认恢复原 ID；执行 `tunneldock sessions` 查看绑定。真实 OpenAI control plane、Restricted API Key 和 ChatGPT 宿主对话行为需在实际部署中验证。
 
-此时可能看到：
+## 文件布局与许可
 
-~~~text
-Address already in use
-Chappie broker is already listening
-mcp_server_reachable FAIL
-~~~
+核心文件：`bin/tunneldock`、`bin/configure-chappie-tunnel`、`libexec/tunneldock-config.py`、`patches/`、`systemd/`、`tests/`、`install.sh`。不包含桌面 UI 或桌面运行时。
 
-这可能只是诊断实例和正常实例互相冲突。
+上游：[otunnel](https://github.com/zetaloop/otunnel)、[Chappie](https://github.com/zetaloop/chappie)、[Pi](https://github.com/earendil-works/pi)。TunnelDock 是独立的部署与运维集成工具。
 
-因此 TunnelDock 的逻辑是：
-
-- service active → 检查现有 /healthz、/readyz、control-plane poll；
-- service inactive → 执行完整 otunnel doctor --profile chappie --explain。
-
-## 8. health port 真正被其他程序占用
-
-检查：
-
-~~~bash
-ss -ltnp | grep 18080
-~~~
-
-重新配置：
-
-~~~bash
-configure-chappie-tunnel \
-  --tunnel-id tunnel_xxxxxxxxx \
-  --health-addr 127.0.0.1:18081
-~~~
-
-## 9. API Key 不要写进仓库、service 或 shell history
-
-默认凭据文件：
-
-~~~text
-~/.chappie/tunnelkey.txt
-~~~
-
-权限为 0600。
-
-otunnel profile 只使用 file: 引用。不要把真实 Key 写入 README、Git commit、systemd unit 或 chappie.json。
-
-## 10. otunnel named profile 的真实位置
-
-当前 named profile 默认位于：
-
-~~~text
-~/.config/tunnel-client/chappie.yaml
-~~~
-
-而不是把所有内容都放在 ~/.chappie/。后者主要用于安全保存凭据文件。
-
----
-
-# 文件布局
-
-~~~text
-tunneldock/
-├── bin/
-│   └── tunneldock
-├── patches/
-│   ├── chappie-0.5.0-chat-scoped-sessions.patch
-│   └── CHAPPIE-LICENSE
-├── systemd/
-│   └── chappie-tunnel.service.example
-├── install.sh
-├── LICENSE
-└── README.md
-~~~
-
-明确不包含：
-
-~~~text
-src-tauri/
-React/
-Vite/
-Tauri/
-desktop icons/
-desktop updater/
-tray/
-window management/
-~~~
-
----
-
-# 更新
-
-~~~bash
-cd ~/tunneldock
-tunneldock update
-~~~
-
-更新流程：
-
-1. git pull --ff-only
-2. 重新安装锁定的 Chappie
-3. 重新应用 chat-scoped session patch
-4. 刷新 systemd unit
-5. service 正在运行时自动重启
-
----
-
-# 手工验证
-
-版本：
-
-~~~bash
-node --version
-npm --version
-pi --version
-otunnel --version
-~~~
-
-Chappie：
-
-~~~bash
-pi --help | grep chappie
-pi list
-~~~
-
-应看到 --chappie / Serve Chappie over MCP。
-
-Tunnel：
-
-~~~bash
-tunneldock doctor
-~~~
-
-会话隔离验证：
-
-1. 在 ChatGPT 新建对话 A 并调用 Chappie，记录 session ID A。
-2. 新建对话 B 并调用，B 应获得不同的 session ID B。
-3. 回到 A 再调用，A 应恢复原 session ID A。
-4. 服务器执行 tunneldock sessions，应看到独立 managed sessions。
-
----
-
-# 会话语义边界
-
-普通新建 ChatGPT 对话会得到新的 Pi session。
-
-如果希望新对话明确继续另一个对话的 Pi 工作，可以显式传原 session ID。
-
-如果 ChatGPT 的 Branch to new chat 在宿主层产生新的 conversation ID，它也会按新对话处理并创建新的 Pi session；当前 patch 不自动复制或 fork 原 Pi transcript。
-
----
-
-# 安全建议
-
-- Tunnel 使用主动出站 HTTPS。
-- API Key 使用文件引用，不进入 Git。
-- service 使用 UMask=0077。
-- Chappie binding/state 位于用户目录。
-- managed Pi session 默认按需运行。
-- 不开放公开 MCP HTTP listener。
-
-仍建议 VPS 使用独立非 root 用户、SSH 密钥、关闭密码登录，并定期安装系统安全更新。
-
----
-
-# 上游与许可
-
-TunnelDock CLI 集成：
-
-- OpenAI Secure MCP Tunnel
-- https://github.com/zetaloop/otunnel
-- https://github.com/earendil-works/pi
-- https://github.com/zetaloop/chappie
-
-Chappie patch 基于其 MIT 许可的 0.5.0 源码差异，许可副本：
-
-~~~text
-patches/CHAPPIE-LICENSE
-~~~
-
-TunnelDock 仅作为集成与 VPS 运维工具，不宣称与上游品牌存在官方从属关系。
-
-## License
-
-TunnelDock CLI 使用 **GNU GPL-3.0**，与原 TunnelDock 项目保持一致。Chappie patch 对应的上游源码采用 MIT License，许可副本见 patches/CHAPPIE-LICENSE。
+TunnelDock CLI 使用 **GNU GPL-3.0**。Chappie 补丁对应的上游代码采用 MIT License，副本见 `patches/CHAPPIE-LICENSE`。

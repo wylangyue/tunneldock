@@ -1,26 +1,34 @@
 diff --git a/src/broker.ts b/src/broker.ts
-index 698860b..a25fd08 100644
+index 698860b..5f36b8d 100644
 --- a/src/broker.ts
 +++ b/src/broker.ts
 @@ -1,5 +1,8 @@
 +import { type ChildProcess, spawn } from "node:child_process";
  import { randomUUID } from "node:crypto";
- import { mkdir } from "node:fs/promises";
+-import { mkdir } from "node:fs/promises";
++import { mkdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 +import { homedir } from "node:os";
 +import { join, resolve } from "node:path";
  import { type Activity, source, sourceLabel } from "./activity.ts";
  import { type Config, readConfig } from "./config.ts";
  import type { DeliveryRecord } from "./delivery.ts";
-@@ -24,7 +27,7 @@ import {
+@@ -24,7 +27,14 @@ import {
  	questionView,
  } from "./questions.ts";
  import { type ResourceData, resourceSessionId } from "./resources.ts";
 -import { State } from "./state.ts";
++import {
++	extensionBuild,
++	ipcLimits,
++	runtimeRevision,
++	StartupDiagnostics,
++	validManagedRuntime,
++} from "./runtime.ts";
 +import { type ManagedSessionRecord, State } from "./state.ts";
  import type { ToolInput } from "./tools.ts";
  
  const observerInstructions =
-@@ -50,6 +53,19 @@ interface ChangeWaiter {
+@@ -50,6 +60,23 @@ interface ChangeWaiter {
  	onAbort(): void;
  }
  
@@ -31,6 +39,10 @@ index 698860b..a25fd08 100644
 +}
 +
 +interface ManagedProcess {
++	nonce: string;
++	cwd: string;
++	diagnostics: StartupDiagnostics;
++	startupFailure?: Error;
 +	child: ChildProcess;
 +	closed: Promise<void>;
 +	stopping: boolean;
@@ -40,7 +52,7 @@ index 698860b..a25fd08 100644
  export interface Initialization {
  	sessionId: string;
  	instructions: string;
-@@ -92,6 +108,10 @@ export class Broker {
+@@ -92,6 +119,29 @@ export class Broker {
  	readonly #pending = new Map<number, PendingRequest>();
  	readonly #waiters = new Set<ChangeWaiter>();
  	readonly #cooldowns = new Map<string, number>();
@@ -48,13 +60,33 @@ index 698860b..a25fd08 100644
 +	readonly #managedStarts = new Map<string, Promise<void>>();
 +	readonly #shutdown = new AbortController();
 +	#autoCreate: AutoCreateOptions | undefined;
++	readonly #diagnostics = new Map<
++		string,
++		{
++			sessionId: string;
++			status: string;
++			code: string;
++			updatedAt: string;
++			pid?: number;
++			piVersion?: string;
++			nodeVersion?: string;
++			toolCount?: number;
++			exitCode?: number;
++			signal?: string;
++			stderrCode?: string;
++			stderrTruncated?: boolean;
++		}
++	>();
++	#diagnosticWrite: Promise<void> = Promise.resolve();
++	#diagnosticDirty = false;
  	readonly #relays = new Map<
  		JsonLinePeer<SessionMessage, BrokerMessage>,
  		Map<number, AbortController>
-@@ -111,6 +131,19 @@ export class Broker {
+@@ -111,13 +161,28 @@ export class Broker {
  
  	async start(): Promise<void> {
  		this.#config = await readConfig(this.#directory);
+-		await mkdir(this.#directory, { recursive: true });
 +		if (this.#config.autoCreate) {
 +			const options =
 +				typeof this.#config.autoCreate === "boolean"
@@ -63,15 +95,16 @@ index 698860b..a25fd08 100644
 +			if (this.#config.connect)
 +				throw new Error("autoCreate requires a local broker; remove connect");
 +			this.#autoCreate = {
-+				cwd: resolve(options.cwd ?? process.cwd()),
++				cwd: await realpath(resolve(options.cwd ?? process.cwd())),
 +				namePrefix: options.namePrefix ?? "chatgpt",
 +				idleMs: (options.idleMinutes ?? 30) * 60_000,
 +			};
 +		}
- 		await mkdir(this.#directory, { recursive: true });
++		await mkdir(this.#directory, { recursive: true, mode: 0o700 });
  		await this.#state.load();
  		await this.#ipc.start(this.#config.listen ?? false);
-@@ -118,6 +151,7 @@ export class Broker {
++		this.#persistDiagnostics();
+ 	}
  
  	async close(): Promise<void> {
  		const error = new Error("Chappie broker ended");
@@ -79,7 +112,7 @@ index 698860b..a25fd08 100644
  		this.#cooldowns.clear();
  		for (const relays of this.#relays.values()) {
  			for (const controller of relays.values()) controller.abort(error);
-@@ -132,6 +166,13 @@ export class Broker {
+@@ -132,9 +197,100 @@ export class Broker {
  			waiter.reject(error);
  		}
  		this.#waiters.clear();
@@ -93,7 +126,103 @@ index 698860b..a25fd08 100644
  		this.#sessions.clear();
  		this.#resources.clear();
  		await this.#ipc.close();
-@@ -305,7 +346,7 @@ export class Broker {
++		this.#persistDiagnostics();
++		await this.#diagnosticWrite;
++	}
++
++	// Only allowlisted runtime metadata leaves the broker. No nonce, argv,
++	// environment, transcript or raw stderr is included.
++	runtimeDiagnostics() {
++		return {
++			revision: runtimeRevision,
++			extensionBuild,
++			pid: process.pid,
++			status: this.#shutdown.signal.aborted ? "stopped" : "running",
++			updatedAt: new Date().toISOString(),
++			limits: ipcLimits,
++			sessions: [...this.#diagnostics.values()].map((item) => {
++				const session = this.#sessions.get(item.sessionId);
++				return {
++					...item,
++					...(session ? { activity: session.description.status } : {}),
++				};
++			}),
++		};
++	}
++
++	#recordDiagnostic(sessionId: string, status: string, code: string): void {
++		const managed = this.#managedProcesses.get(sessionId);
++		const runtime = this.#sessions.get(sessionId)?.description.runtime;
++		const previous =
++			status === "starting" ? undefined : this.#diagnostics.get(sessionId);
++		this.#diagnostics.delete(sessionId);
++		this.#diagnostics.set(sessionId, {
++			...previous,
++			sessionId,
++			status,
++			code,
++			updatedAt: new Date().toISOString(),
++			...(managed?.child.pid ? { pid: managed.child.pid } : {}),
++			...(runtime
++				? {
++						piVersion: runtime.piVersion,
++						nodeVersion: runtime.nodeVersion,
++						toolCount: runtime.tools.length,
++					}
++				: {}),
++			...(managed
++				? {
++						stderrCode: managed.diagnostics.code,
++						stderrTruncated: managed.diagnostics.truncated,
++					}
++				: {}),
++		});
++		if (this.#diagnostics.size > 256) {
++			const oldest =
++				[...this.#diagnostics.keys()].find(
++					(id) => !this.#managedProcesses.has(id),
++				) ?? this.#diagnostics.keys().next().value;
++			if (oldest) this.#diagnostics.delete(oldest);
++		}
++		this.#persistDiagnostics();
++	}
++
++	#persistDiagnostics(): void {
++		if (this.#diagnosticDirty) return;
++		this.#diagnosticDirty = true;
++		this.#diagnosticWrite = this.#diagnosticWrite.then(async () => {
++			while (this.#diagnosticDirty) {
++				this.#diagnosticDirty = false;
++				const path = join(this.#directory, `runtime.${randomUUID()}.tmp`);
++				try {
++					await writeFile(
++						path,
++						`${JSON.stringify(this.runtimeDiagnostics())}\n`,
++						{ mode: 0o600, flag: "wx" },
++					);
++					await rename(path, join(this.#directory, "runtime.json"));
++				} catch {
++					console.error(
++						"[tunneldock] runtime diagnostic snapshot write failed",
++					);
++				} finally {
++					await rm(path, { force: true }).catch(() => {});
++				}
++			}
++		});
+ 	}
+ 
+ 	listSessions(sessionId?: string): (SessionDescription & {
+@@ -144,7 +300,7 @@ export class Broker {
+ 		return [...this.#sessions.values()]
+ 			.filter(({ description }) => !sessionId || description.id === sessionId)
+ 			.map(({ description }) => ({
+-				...description,
++				...publicDescription(description),
+ 				bindingCount: counts.get(description.id) ?? 0,
+ 			}));
+ 	}
+@@ -305,7 +461,7 @@ export class Broker {
  	) {
  		const target = sessionId ?? this.#state.binding(chatId);
  		if (!target) throw new Error("Specify a sessionId to read history");
@@ -102,7 +231,7 @@ index 698860b..a25fd08 100644
  		const result = await this.#request(
  			target,
  			(id) => ({
-@@ -327,7 +368,12 @@ export class Broker {
+@@ -327,7 +483,12 @@ export class Broker {
  		signal: AbortSignal,
  	): Promise<SessionInput[]> {
  		const target = sessionId ?? this.#state.binding(chatId);
@@ -116,7 +245,94 @@ index 698860b..a25fd08 100644
  		const result = await this.#request(
  			target,
  			(id) => ({ type: "inputs", id, sessionId: target }),
-@@ -607,6 +653,18 @@ export class Broker {
+@@ -501,7 +662,15 @@ export class Broker {
+ 		);
+ 		if ("inputs" in result)
+ 			await this.#ackInputs(request.sessionId, result.inputs, signal);
+-		return result;
++		return "inspection" in result
++			? {
++					...result,
++					inspection: {
++						...result.inspection,
++						session: publicDescription(result.inspection.session),
++					},
++				}
++			: result;
+ 	}
+ 
+ 	async #receive(
+@@ -509,12 +678,31 @@ export class Broker {
+ 		message: SessionMessage,
+ 	): Promise<void> {
+ 		switch (message.type) {
++			case "diagnostics":
++				await peer.send({
++					type: "diagnostics",
++					id: message.id,
++					diagnostics: this.runtimeDiagnostics(),
++				});
++				break;
+ 			case "request": {
+ 				let relays = this.#relays.get(peer);
+ 				if (!relays) {
+ 					relays = new Map();
+ 					this.#relays.set(peer, relays);
+ 				}
++				if (relays.has(message.id)) {
++					peer.close();
++					break;
++				}
++				if (relays.size >= ipcLimits.pendingPerPeer) {
++					await peer.send({
++						type: "response",
++						id: message.id,
++						error: "Broker relay capacity exceeded",
++					});
++					break;
++				}
+ 				const controller = new AbortController();
+ 				relays.set(message.id, controller);
+ 				void this.request(message.request, controller.signal)
+@@ -551,12 +739,37 @@ export class Broker {
+ 					?.abort(new Error("Request cancelled"));
+ 				break;
+ 			case "sync": {
++				const managed = this.#managedProcesses.get(message.session.id);
++				if (this.#state.managedSession(message.session.id) && !managed) {
++					peer.close();
++					break;
++				}
++				if (
++					managed &&
++					(!validManagedRuntime(message.session, managed) ||
++						(this.#sessions.has(message.session.id) &&
++							this.#sessions.get(message.session.id)?.peer !== peer))
++				) {
++					managed.startupFailure = new Error(
++						"Managed Pi runtime handshake mismatch",
++					);
++					this.#recordDiagnostic(
++						message.session.id,
++						"failed",
++						"handshake_mismatch",
++					);
++					peer.close();
++					this.#stopManagedProcess(managed);
++					this.#notifyChange();
++					break;
++				}
+ 				const registered =
+ 					this.#sessions.get(message.session.id)?.peer === peer;
+ 				this.#sessions.set(message.session.id, {
+ 					description: message.session,
+ 					peer,
+ 				});
++				if (managed && registered) this.#persistDiagnostics();
+ 				await peer.send({
+ 					type: "synced",
+ 					id: message.id,
+@@ -607,6 +820,18 @@ export class Broker {
  			signal.throwIfAborted();
  			const boundId = this.#state.binding(chatId);
  			let target = requestedId ?? boundId;
@@ -135,7 +351,7 @@ index 698860b..a25fd08 100644
  			if (!target) {
  				const occupied = this.#state.bindingCounts();
  				target = [...this.#sessions.keys()].find((id) => !occupied.has(id));
-@@ -615,10 +673,12 @@ export class Broker {
+@@ -615,10 +840,12 @@ export class Broker {
  				await this.#waitForChange(signal);
  				continue;
  			}
@@ -150,7 +366,7 @@ index 698860b..a25fd08 100644
  					? await this.#join(chatId, target, requestId, signal, bindRequested)
  					: undefined;
  			return {
-@@ -633,6 +693,169 @@ export class Broker {
+@@ -633,6 +860,263 @@ export class Broker {
  		}
  	}
  
@@ -162,8 +378,11 @@ index 698860b..a25fd08 100644
 +		if (stopping?.stopping) await stopping.closed;
 +		signal.throwIfAborted();
 +		const managed = this.#state.managedSession(sessionId);
-+		if (managed && !this.#sessions.has(sessionId)) {
-+			await this.#ensureManagedSession(sessionId, managed, signal);
++		if (
++			this.#managedStarts.has(sessionId) ||
++			(managed && !this.#sessions.has(sessionId))
++		) {
++			if (managed) await this.#ensureManagedSession(sessionId, managed, signal);
 +		}
 +		await this.#waitForSession(sessionId, signal);
 +		this.#touchManagedSession(sessionId);
@@ -174,7 +393,8 @@ index 698860b..a25fd08 100644
 +		managed: ManagedSessionRecord,
 +		signal: AbortSignal,
 +	): Promise<void> {
-+		if (this.#sessions.has(sessionId)) return;
++		if (this.#sessions.has(sessionId) && !this.#managedStarts.has(sessionId))
++			return;
 +		let starting = this.#managedStarts.get(sessionId);
 +		if (!starting) {
 +			starting = this.#startManagedSession(sessionId, managed);
@@ -201,10 +421,18 @@ index 698860b..a25fd08 100644
 +		sessionId: string,
 +		managed: ManagedSessionRecord,
 +	): Promise<void> {
++		if (!/^[a-f0-9-]{36}$/.test(sessionId))
++			throw new Error("Invalid managed Pi session ID");
 +		const previous = this.#managedProcesses.get(sessionId);
 +		if (previous?.stopping) await previous.closed;
 +		this.#shutdown.signal.throwIfAborted();
 +		if (this.#sessions.has(sessionId)) return;
++		const cwd = await realpath(managed.cwd).catch(() => {
++			this.#recordDiagnostic(sessionId, "failed", "cwd_unavailable");
++			throw new Error("Managed Pi cwd is unavailable");
++		});
++		const nonce = randomUUID();
++		const diagnostics = new StartupDiagnostics();
 +		const child = spawn(
 +			"pi",
 +			[
@@ -219,23 +447,53 @@ index 698860b..a25fd08 100644
 +				...(managed.name ? ["--name", managed.name] : []),
 +			],
 +			{
-+				cwd: managed.cwd,
++				cwd,
 +				env: {
 +					...process.env,
++					TUNNELDOCK_PI_NONCE: nonce,
 +					PI_CODING_AGENT_DIR:
 +						process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"),
 +				},
-+				stdio: ["pipe", "ignore", "ignore"],
++				stdio: ["pipe", "ignore", "pipe"],
 +			},
 +		);
 +		const completion = Promise.withResolvers<void>();
 +		const processRecord: ManagedProcess = {
 +			child,
++			nonce,
++			cwd,
++			diagnostics,
 +			closed: completion.promise,
 +			stopping: false,
 +		};
 +		this.#managedProcesses.set(sessionId, processRecord);
-+		child.once("close", () => {
++		child.stderr?.on("data", (chunk: Buffer) => diagnostics.append(chunk));
++		child.stdin?.on("error", () => {});
++		this.#recordDiagnostic(sessionId, "starting", "awaiting_handshake");
++		child.once("close", (code, childSignal) => {
++			const previousDiagnostic = this.#diagnostics.get(sessionId);
++			this.#recordDiagnostic(
++				sessionId,
++				previousDiagnostic?.status === "failed"
++					? "failed"
++					: processRecord.stopping
++						? "offline"
++						: "failed",
++				previousDiagnostic?.status === "failed"
++					? previousDiagnostic.code
++					: processRecord.stopping
++						? "process_stopped"
++						: "unexpected_exit",
++			);
++			const diagnostic = this.#diagnostics.get(sessionId);
++			if (diagnostic) {
++				if (code !== null) diagnostic.exitCode = code;
++				if (childSignal !== null) diagnostic.signal = childSignal;
++			}
++			if (!processRecord.stopping)
++				console.error(
++					`[tunneldock] Managed Pi session ${sessionId}: unexpected_exit`,
++				);
 +			if (processRecord.idleTimer) clearTimeout(processRecord.idleTimer);
 +			if (this.#managedProcesses.get(sessionId) === processRecord)
 +				this.#managedProcesses.delete(sessionId);
@@ -243,11 +501,20 @@ index 698860b..a25fd08 100644
 +			this.#notifyChange();
 +		});
 +		const failed = new Promise<never>((_resolve, reject) => {
-+			child.once("error", reject);
++			child.once("error", (error: NodeJS.ErrnoException) => {
++				const code =
++					error.code === "ENOENT"
++						? "pi_not_found"
++						: error.code === "EACCES"
++							? "permission_denied"
++							: "spawn_failed";
++				this.#recordDiagnostic(sessionId, "failed", code);
++				reject(new Error(`Managed Pi spawn failed (${code})`));
++			});
 +			child.once("exit", (code, childSignal) =>
 +				reject(
 +					new Error(
-+						`Managed Pi session ${sessionId} exited (code=${String(code)}, signal=${String(childSignal)})`,
++						`Managed Pi session ${sessionId} exited (code=${String(code)}, signal=${String(childSignal)}, stderr=${diagnostics.code})`,
 +					),
 +				),
 +			);
@@ -260,16 +527,59 @@ index 698860b..a25fd08 100644
 +		]);
 +		try {
 +			await Promise.race([
-+				this.#waitForSession(sessionId, startupSignal),
++				(async () => {
++					while (!this.#sessions.has(sessionId)) {
++						if (processRecord.startupFailure)
++							throw processRecord.startupFailure;
++						await this.#waitForChange(startupSignal);
++					}
++					if (processRecord.startupFailure) throw processRecord.startupFailure;
++					const result = await this.#inspect(sessionId, startupSignal, true);
++					const observedTools = result.inspection.session.runtime?.tools;
++					if (
++						result.inspection.session.id !== sessionId ||
++						!validManagedRuntime(result.inspection.session, processRecord) ||
++						!Array.isArray(result.inspection.tools) ||
++						!observedTools ||
++						!result.inspection.tools.some((tool) => tool.name === "read") ||
++						result.inspection.tools.length !== observedTools.length ||
++						new Set(result.inspection.tools.map((tool) => tool.name)).size !==
++							result.inspection.tools.length ||
++						result.inspection.tools.some(
++							(tool) => !observedTools.includes(tool.name),
++						)
++					) {
++						this.#recordDiagnostic(sessionId, "failed", "inspection_mismatch");
++						throw new Error("Managed Pi runtime inspection mismatch");
++					}
++				})(),
 +				failed,
 +			]);
-+		} catch (error) {
++		} catch {
++			const current = this.#diagnostics.get(sessionId);
++			const code =
++				current?.status === "failed"
++					? current.code
++					: this.#shutdown.signal.aborted
++						? "broker_stopped"
++						: startupSignal.aborted
++							? "startup_timeout"
++							: processRecord.startupFailure
++								? "handshake_mismatch"
++								: "startup_failed";
++			this.#recordDiagnostic(sessionId, "failed", code);
 +			this.#stopManagedProcess(processRecord);
 +			await processRecord.closed;
-+			throw error;
++			console.error(
++				`[tunneldock] Managed Pi session ${sessionId}: ${code} (stderr=${diagnostics.code})`,
++			);
++			throw new Error(
++				`Managed Pi session ${sessionId} exited or failed (code=${code}, stderr=${diagnostics.code})`,
++			);
 +		} finally {
 +			registered.abort();
 +		}
++		this.#recordDiagnostic(sessionId, "online", "handshake_verified");
 +		this.#touchManagedSession(sessionId);
 +	}
 +
@@ -320,7 +630,45 @@ index 698860b..a25fd08 100644
  	async #join(
  		chatId: string,
  		sessionId: string,
-@@ -766,7 +989,9 @@ export class Broker {
+@@ -696,13 +1180,23 @@ export class Broker {
+ 	async #inspect(
+ 		sessionId: string,
+ 		signal: AbortSignal,
++		includeRuntime = false,
+ 	): Promise<Extract<SessionResult, { inspection: SessionInspection }>> {
+ 		const result = await this.#request(
+ 			sessionId,
+ 			(id) => ({ type: "inspect", id, sessionId }),
+ 			signal,
+ 		);
+-		if ("inspection" in result) return result;
++		if ("inspection" in result)
++			return includeRuntime
++				? result
++				: {
++						...result,
++						inspection: {
++							...result.inspection,
++							session: publicDescription(result.inspection.session),
++						},
++					};
+ 		throw new Error("Session returned no inspection");
+ 	}
+ 
+@@ -738,6 +1232,12 @@ export class Broker {
+ 			throw new Error(
+ 				`Session resource or target is unavailable: ${sessionId}`,
+ 			);
++		if (
++			this.#pending.size >= ipcLimits.pendingTotal ||
++			[...this.#pending.values()].filter((item) => item.peer === peer).length >=
++				ipcLimits.pendingPerPeer
++		)
++			throw new Error("Broker request capacity exceeded");
+ 		const completion = Promise.withResolvers<SessionResult>();
+ 		const onAbort = (): void => {
+ 			const pending = this.#pending.get(id);
+@@ -766,7 +1266,9 @@ export class Broker {
  			this.#finishRequest(id, pending);
  			pending.reject(error instanceof Error ? error : new Error(String(error)));
  		});
@@ -331,6 +679,63 @@ index 698860b..a25fd08 100644
  	}
  
  	#waitForChange(signal: AbortSignal): Promise<void> {
+@@ -819,6 +1321,11 @@ export class Broker {
+ 	}
+ 
+ 	#removeSession(sessionId: string): void {
++		const managed = this.#managedProcesses.get(sessionId);
++		if (managed && !managed.stopping) {
++			this.#recordDiagnostic(sessionId, "failed", "ipc_disconnected");
++			this.#stopManagedProcess(managed);
++		}
+ 		this.#sessions.delete(sessionId);
+ 		this.#notifyChange();
+ 	}
+@@ -831,3 +1338,10 @@ function abortError(signal: AbortSignal): Error {
+ 				typeof signal.reason === "string" ? signal.reason : "Request cancelled",
+ 			);
+ }
++
++function publicDescription(
++	description: SessionDescription,
++): SessionDescription {
++	const { runtime: _runtime, ...publicSession } = description;
++	return publicSession;
++}
+diff --git a/src/cli.ts b/src/cli.ts
+index 8f53f20..5c37f9f 100644
+--- a/src/cli.ts
++++ b/src/cli.ts
+@@ -8,10 +8,12 @@ const { values, positionals } = parseArgs({
+ 		help: { type: "boolean", short: "h" },
+ 		version: { type: "boolean", short: "v" },
+ 		provider: { type: "boolean" },
++		json: { type: "boolean" },
++		check: { type: "boolean" },
+ 	},
+ });
+ 
+-const usage = "Usage: chappie [codex [setup]]";
++const usage = "Usage: chappie [codex [setup] | diagnostics [--json] [--check]]";
+ 
+ if (values.help) {
+ 	console.log(
+@@ -22,6 +24,15 @@ if (values.help) {
+ } else {
+ 	try {
+ 		if (
++			positionals.length === 1 &&
++			positionals[0] === "diagnostics" &&
++			!values.provider
++		) {
++			const { showDiagnostics } = await import("./diagnostics.ts");
++			await showDiagnostics(values.json, values.check);
++		} else if (values.json || values.check) {
++			throw new Error(usage);
++		} else if (
+ 			positionals.length === 2 &&
+ 			positionals[0] === "codex" &&
+ 			positionals[1] === "setup" &&
 diff --git a/src/config.ts b/src/config.ts
 index ca374f2..8b63a2c 100644
 --- a/src/config.ts
@@ -353,6 +758,164 @@ index ca374f2..8b63a2c 100644
  	ask: z.boolean().optional(),
  	cooldown: z.number().nonnegative().optional(),
  	localTools: z.boolean().optional(),
+diff --git a/src/diagnostics.ts b/src/diagnostics.ts
+new file mode 100644
+index 0000000..082ecda
+--- /dev/null
++++ b/src/diagnostics.ts
+@@ -0,0 +1,152 @@
++import { createConnection } from "node:net";
++import * as z from "zod";
++import { getDirectory } from "./config.ts";
++import {
++	type BrokerMessage,
++	ipcEndpoint,
++	JsonLinePeer,
++	type SessionMessage,
++} from "./ipc.ts";
++
++const version = z
++	.string()
++	.max(64)
++	.regex(/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/);
++const snapshotSchema = z.object({
++	revision: z.literal(1),
++	extensionBuild: version,
++	pid: z.number().int().positive(),
++	status: z.enum(["running", "stopped"]),
++	updatedAt: z.iso.datetime(),
++	limits: z.object({
++		frameBytes: z.number().int().positive(),
++		writeBytes: z.number().int().positive(),
++		readBytes: z.number().int().positive(),
++		handlers: z.number().int().positive(),
++		peers: z.number().int().positive(),
++		pendingPerPeer: z.number().int().positive(),
++		pendingTotal: z.number().int().positive(),
++		sessionQueue: z.number().int().positive(),
++		sessionQueueBytes: z.number().int().positive(),
++	}),
++	sessions: z
++		.array(
++			z.object({
++				sessionId: z.uuid(),
++				status: z.enum(["starting", "online", "offline", "failed"]),
++				code: z.enum([
++					"awaiting_handshake",
++					"handshake_verified",
++					"handshake_mismatch",
++					"inspection_mismatch",
++					"ipc_disconnected",
++					"cwd_unavailable",
++					"pi_not_found",
++					"permission_denied",
++					"spawn_failed",
++					"process_stopped",
++					"unexpected_exit",
++					"broker_stopped",
++					"startup_timeout",
++					"startup_failed",
++				]),
++				updatedAt: z.iso.datetime(),
++				activity: z
++					.enum(["idle", "ready", "executing", "generating"])
++					.optional(),
++				pid: z.number().int().positive().optional(),
++				piVersion: version.optional(),
++				nodeVersion: version.optional(),
++				toolCount: z.number().int().min(0).max(128).optional(),
++				exitCode: z.number().int().optional(),
++				signal: z
++					.string()
++					.regex(/^SIG[A-Z0-9]{1,16}$/)
++					.optional(),
++				stderrCode: z
++					.enum([
++						"no_diagnostic",
++						"module_not_found",
++						"syntax_error",
++						"permission_denied",
++						"extension_load_failed",
++						"provider_unavailable",
++					])
++					.optional(),
++				stderrTruncated: z.boolean().optional(),
++			}),
++		)
++		.max(256),
++});
++
++export async function queryDiagnostics(directory = getDirectory()) {
++	const socket = createConnection(ipcEndpoint(directory));
++	let peer: JsonLinePeer<BrokerMessage, SessionMessage> | undefined;
++	try {
++		const value = await new Promise<unknown>((resolve, reject) => {
++			const timer = setTimeout(() => reject(new Error("timeout")), 5_000);
++			socket.once("error", () => reject(new Error("unavailable")));
++			socket.once("close", () => {
++				clearTimeout(timer);
++				reject(new Error("closed"));
++			});
++			socket.once("connect", () => {
++				peer = new JsonLinePeer(
++					socket,
++					(message) => {
++						if (message.type !== "diagnostics" || message.id !== 1) return;
++						clearTimeout(timer);
++						resolve(message.diagnostics);
++					},
++					() => reject(new Error("closed")),
++				);
++				void peer
++					.send({ type: "diagnostics", id: 1 })
++					.catch(() => reject(new Error("send_failed")));
++			});
++		});
++		return snapshotSchema.parse(value);
++	} catch {
++		throw new Error(
++			"Broker runtime diagnostics unavailable; check service, socket and build version",
++		);
++	} finally {
++		peer?.close();
++		socket.destroy();
++	}
++}
++
++export async function showDiagnostics(
++	json = false,
++	check = false,
++): Promise<void> {
++	const snapshot = await queryDiagnostics();
++	if (json) console.log(JSON.stringify(snapshot));
++	else {
++		console.log(
++			`PASS  broker IPC reachable (pid=${snapshot.pid}, build=${snapshot.extensionBuild})`,
++		);
++		const online = snapshot.sessions.filter(
++			(session) => session.status === "online",
++		);
++		if (online.length)
++			console.log(
++				`PASS  ${online.length} managed Pi runtime handshake(s) verified`,
++			);
++		else
++			console.log(
++				"WARN  no managed Pi currently online; a live Pi handshake has not been checked by this command",
++			);
++		for (const session of snapshot.sessions)
++			console.log(
++				`${session.sessionId} ${session.status}${session.activity ? `/${session.activity}` : ""} ${session.code} pi=${session.piVersion ?? "unknown"} stderr=${session.stderrCode ?? "no_diagnostic"}`,
++			);
++	}
++	if (
++		check &&
++		snapshot.sessions.some(
++			(session) => session.status === "failed" || session.status === "starting",
++		)
++	)
++		process.exitCode = 1;
++}
 diff --git a/src/instructions.md b/src/instructions.md
 index 39c1d1d..cd30686 100644
 --- a/src/instructions.md
@@ -366,6 +929,341 @@ index 39c1d1d..cd30686 100644
  
  Read recent history to recover progress. Use tools to obtain native definitions before constructing call arguments.
  
+diff --git a/src/ipc.ts b/src/ipc.ts
+index 3717834..c27709d 100644
+--- a/src/ipc.ts
++++ b/src/ipc.ts
+@@ -22,11 +22,14 @@ import type {
+ } from "./host.ts";
+ import type { ResourceData, ResourceDescriptor } from "./resources.ts";
+ 
++import { ipcLimits, type RuntimeHandshake } from "./runtime.ts";
++
+ const defaultPort = 24274;
+ 
+ export type SessionStatus = "idle" | "ready" | "executing" | "generating";
+ 
+ export interface SessionDescription {
++	runtime?: RuntimeHandshake;
+ 	id: string;
+ 	agent: string;
+ 	model?: string;
+@@ -105,6 +108,7 @@ export type ClientRequest =
+ 	| { type: "sessions"; sessionId?: string };
+ 
+ export type SessionMessage =
++	| { type: "diagnostics"; id: number }
+ 	| { type: "sync"; id: number; session: SessionDescription }
+ 	| { type: "unregister"; sessionId: string }
+ 	| { type: "resources"; resources: ResourceDescriptor[] }
+@@ -114,6 +118,7 @@ export type SessionMessage =
+ 	| ({ type: "result"; id: number } & SessionResult);
+ 
+ export type BrokerMessage =
++	| { type: "diagnostics"; id: number; diagnostics: unknown }
+ 	| { type: "synced"; id: number; sessionId: string }
+ 	| { type: "stored"; id: string }
+ 	| { type: "notice"; sessionId: string; message: string; activity?: Activity }
+@@ -135,6 +140,10 @@ export class JsonLinePeer<Incoming, Outgoing> {
+ 	readonly #onClose: () => void;
+ 	#buffer = "";
+ 	#closed = false;
++	#bufferBytes = 0;
++	#processing = 0;
++	#processingBytes = 0;
++	#writeBytes = 0;
+ 
+ 	constructor(
+ 		socket: Socket,
+@@ -148,6 +157,8 @@ export class JsonLinePeer<Incoming, Outgoing> {
+ 		socket.on("data", (chunk: string) => this.#receive(chunk));
+ 		socket.once("close", () => {
+ 			this.#closed = true;
++			this.#buffer = "";
++			this.#bufferBytes = 0;
+ 			this.#onClose();
+ 		});
+ 		socket.on("error", () => {});
+@@ -159,12 +170,19 @@ export class JsonLinePeer<Incoming, Outgoing> {
+ 
+ 	send(message: Outgoing): Promise<void> {
+ 		const line = `${JSON.stringify(message)}\n`;
++		const bytes = Buffer.byteLength(line);
++		if (bytes - 1 > ipcLimits.frameBytes)
++			return Promise.reject(new Error("IPC frame capacity exceeded"));
++		if (this.#writeBytes + bytes > ipcLimits.writeBytes)
++			return Promise.reject(new Error("IPC write capacity exceeded"));
+ 		return new Promise<void>((resolveWrite, rejectWrite) => {
+ 			if (this.#closed) {
+ 				rejectWrite(new Error("Chappie IPC connection is closed"));
+ 				return;
+ 			}
++			this.#writeBytes += bytes;
+ 			this.#socket.write(line, (error) => {
++				this.#writeBytes -= bytes;
+ 				if (error) rejectWrite(error);
+ 				else resolveWrite();
+ 			});
+@@ -172,25 +190,62 @@ export class JsonLinePeer<Incoming, Outgoing> {
+ 	}
+ 
+ 	close(): void {
+-		if (!this.#closed) this.#socket.end();
++		if (!this.#closed) {
++			this.#closed = true;
++			this.#buffer = "";
++			this.#bufferBytes = 0;
++			this.#socket.destroy();
++		}
+ 	}
+ 
+ 	#receive(chunk: string): void {
+-		this.#buffer += chunk;
+-		let end = this.#buffer.indexOf("\n");
+-		while (end !== -1) {
+-			const line = this.#buffer.slice(0, end);
+-			this.#buffer = this.#buffer.slice(end + 1);
+-			if (line.length > 0) {
+-				void Promise.resolve()
+-					.then(() => this.#onMessage(JSON.parse(line) as Incoming))
+-					.catch((error: unknown) => {
+-						this.#socket.destroy(
+-							error instanceof Error ? error : new Error(String(error)),
+-						);
+-					});
++		if (this.#closed) return;
++		try {
++			let start = 0;
++			for (;;) {
++				const end = chunk.indexOf("\n", start);
++				const part = chunk.slice(start, end === -1 ? undefined : end);
++				this.#bufferBytes += Buffer.byteLength(part);
++				if (this.#bufferBytes > ipcLimits.frameBytes)
++					throw new Error("IPC frame capacity exceeded");
++				if (this.#processingBytes + this.#bufferBytes > ipcLimits.readBytes)
++					throw new Error("IPC receive capacity exceeded");
++				this.#buffer += part;
++				if (end === -1) return;
++				const line = this.#buffer;
++				const lineBytes = this.#bufferBytes;
++				this.#buffer = "";
++				this.#bufferBytes = 0;
++				if (line.length > 0) {
++					if (this.#processing >= ipcLimits.handlers)
++						throw new Error("IPC handler capacity exceeded");
++					// Do not serialize callbacks: requests may await a reply on this
++					// very connection. Replies and cancellations must keep flowing.
++					this.#processing++;
++					this.#processingBytes += lineBytes;
++					void Promise.resolve()
++						.then(() => {
++							if (this.#closed) return;
++							let message: Incoming;
++							try {
++								message = JSON.parse(line) as Incoming;
++							} catch {
++								throw new Error("Invalid IPC JSON frame");
++							}
++							return this.#onMessage(message);
++						})
++						.catch(() => this.close())
++						.finally(() => {
++							this.#processing--;
++							this.#processingBytes -= lineBytes;
++						});
++				}
++				start = end + 1;
+ 			}
+-			end = this.#buffer.indexOf("\n");
++		} catch {
++			this.#buffer = "";
++			this.#bufferBytes = 0;
++			this.close();
+ 		}
+ 	}
+ }
+@@ -251,6 +306,10 @@ export class IpcServer {
+ 
+ 	#createServer(): Server {
+ 		return createServer((socket) => {
++			if (this.#peers.size >= ipcLimits.peers) {
++				socket.destroy();
++				return;
++			}
+ 			let peer: JsonLinePeer<SessionMessage, BrokerMessage>;
+ 			peer = new JsonLinePeer(
+ 				socket,
+diff --git a/src/pi.ts b/src/pi.ts
+index 2b0274c..bf16c2c 100644
+--- a/src/pi.ts
++++ b/src/pi.ts
+@@ -16,6 +16,7 @@ import {
+ 	type ExtensionContext,
+ 	getAgentDir,
+ 	type SessionEntry,
++	VERSION,
+ 	withFileMutationQueue,
+ } from "@earendil-works/pi-coding-agent";
+ import { Text } from "@earendil-works/pi-tui";
+@@ -28,6 +29,11 @@ import type { SessionInput } from "./ipc.ts";
+ import { journalHistory } from "./journal.ts";
+ import { localDeliveries, localTools } from "./local.ts";
+ import { createMessage, ProviderOutput } from "./provider.ts";
++import {
++	extensionBuild,
++	runtimeCapabilities,
++	runtimeRevision,
++} from "./runtime.ts";
+ import { Session } from "./session.ts";
+ import { transfer } from "./transfer.ts";
+ 
+@@ -38,6 +44,8 @@ interface Notice extends Activity {
+ 
+ export default async function chappie(pi: ExtensionAPI): Promise<void> {
+ 	const config = await readConfig();
++	const nonce = process.env.TUNNELDOCK_PI_NONCE;
++	delete process.env.TUNNELDOCK_PI_NONCE;
+ 	let context: ExtensionContext | undefined;
+ 	let model: ExtensionContext["model"];
+ 	let inputCursor: string | null = null;
+@@ -57,6 +65,19 @@ export default async function chappie(pi: ExtensionAPI): Promise<void> {
+ 				agent: "pi",
+ 				cwd: ctx.cwd,
+ 				device: hostname(),
++				...(nonce
++					? {
++							runtime: {
++								revision: runtimeRevision,
++								nonce,
++								extensionBuild,
++								piVersion: VERSION,
++								nodeVersion: process.versions.node,
++								capabilities: runtimeCapabilities,
++								tools: pi.getActiveTools(),
++							},
++						}
++					: {}),
+ 				...(model ? { model: `${model.provider}/${model.id}` } : {}),
+ 				...(name ? { name } : {}),
+ 			};
+diff --git a/src/runtime.ts b/src/runtime.ts
+new file mode 100644
+index 0000000..c662b37
+--- /dev/null
++++ b/src/runtime.ts
+@@ -0,0 +1,112 @@
++import { timingSafeEqual } from "node:crypto";
++import packageJson from "../package.json" with { type: "json" };
++import type { SessionDescription } from "./ipc.ts";
++
++export const runtimeRevision = 1;
++export const extensionBuild = packageJson.version;
++export const runtimeCapabilities = [
++	"inspect",
++	"history",
++	"call",
++	"cancel",
++	"settled",
++];
++export const ipcLimits = {
++	frameBytes: 16 * 1024 * 1024,
++	writeBytes: 32 * 1024 * 1024,
++	readBytes: 32 * 1024 * 1024,
++	handlers: 64,
++	peers: 64,
++	pendingPerPeer: 64,
++	pendingTotal: 256,
++	sessionQueue: 64,
++	sessionQueueBytes: 16 * 1024 * 1024,
++};
++
++export interface RuntimeHandshake {
++	revision: number;
++	nonce: string;
++	extensionBuild: string;
++	piVersion: string;
++	nodeVersion: string;
++	capabilities: string[];
++	tools: string[];
++}
++
++export function validManagedRuntime(
++	session: SessionDescription,
++	expected: { nonce: string; cwd: string },
++): boolean {
++	const runtime = session.runtime;
++	if (
++		!runtime ||
++		typeof runtime.nonce !== "string" ||
++		!/^[-a-f0-9]{36}$/.test(runtime.nonce) ||
++		runtime.nonce.length !== expected.nonce.length ||
++		!timingSafeEqual(Buffer.from(runtime.nonce), Buffer.from(expected.nonce))
++	)
++		return false;
++	return (
++		session.agent === "pi" &&
++		session.cwd === expected.cwd &&
++		session.model === "chappie/chatgpt" &&
++		["idle", "ready", "executing", "generating"].includes(session.status) &&
++		runtime.revision === runtimeRevision &&
++		runtime.extensionBuild === extensionBuild &&
++		typeof runtime.piVersion === "string" &&
++		runtime.piVersion.length <= 64 &&
++		/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(runtime.piVersion) &&
++		typeof runtime.nodeVersion === "string" &&
++		runtime.nodeVersion.length <= 32 &&
++		/^\d+\.\d+\.\d+$/.test(runtime.nodeVersion) &&
++		Number(runtime.nodeVersion.split(".")[0]) >= 26 &&
++		Array.isArray(runtime.capabilities) &&
++		runtime.capabilities.length === runtimeCapabilities.length &&
++		runtimeCapabilities.every((value) =>
++			runtime.capabilities.includes(value),
++		) &&
++		Array.isArray(runtime.tools) &&
++		runtime.tools.length <= 128 &&
++		runtime.tools.every(
++			(value) => typeof value === "string" && /^[\w.-]{1,128}$/.test(value),
++		) &&
++		new Set(runtime.tools).size === runtime.tools.length &&
++		runtime.tools.includes("read")
++	);
++}
++
++// Inspect at most 64 KiB. Arbitrary stderr is never returned or persisted: even
++// unknown credential formats cannot escape via a parser error or stack trace.
++export class StartupDiagnostics {
++	#bytes = 0;
++	#tail = "";
++	code = "no_diagnostic";
++	truncated = false;
++
++	append(chunk: Buffer): void {
++		const available = Math.max(0, 64 * 1024 - this.#bytes);
++		this.truncated ||= chunk.length > available;
++		if (!available) return;
++		const text = this.#tail + chunk.subarray(0, available).toString("utf8");
++		this.#bytes += Math.min(chunk.length, available);
++		for (const [pattern, code] of [
++			[
++				/MODULE_NOT_FOUND|ERR_MODULE_NOT_FOUND|Cannot find (?:module|package)/i,
++				"module_not_found",
++			],
++			[/SyntaxError|Unexpected token/i, "syntax_error"],
++			[/EACCES|Permission denied/i, "permission_denied"],
++			[
++				/extension.{0,40}(?:fail|error)|(?:fail|error).{0,40}extension/i,
++				"extension_load_failed",
++			],
++			[/unknown provider|provider.{0,40}not found/i, "provider_unavailable"],
++		] as const) {
++			if (pattern.test(text)) {
++				this.code = code;
++				break;
++			}
++		}
++		this.#tail = text.slice(-128);
++	}
++}
 diff --git a/src/server.ts b/src/server.ts
 index 7c68f2c..31bf78d 100644
 --- a/src/server.ts
@@ -379,6 +1277,42 @@ index 7c68f2c..31bf78d 100644
  					),
  			}),
  			annotations: toolAnnotations,
+diff --git a/src/session.ts b/src/session.ts
+index e1c0d54..2ee1f02 100644
+--- a/src/session.ts
++++ b/src/session.ts
+@@ -33,6 +33,7 @@ import {
+ 	Resources,
+ 	resourceSessionId,
+ } from "./resources.ts";
++import { ipcLimits } from "./runtime.ts";
+ import type { ToolInput } from "./tools.ts";
+ 
+ type RemoteRequest = Extract<BrokerMessage, { type: "chat" | "call" }>;
+@@ -654,6 +655,14 @@ export class Session {
+ 					await this.#cancelPending(message);
+ 					break;
+ 				}
++				if (
++					this.#queue.length >= ipcLimits.sessionQueue ||
++					Buffer.byteLength(JSON.stringify([...this.#queue, message])) >
++						ipcLimits.sessionQueueBytes
++				) {
++					await this.#sendError(message.id, "Session queue capacity exceeded");
++					break;
++				}
+ 				this.#queue.push(message);
+ 				this.#dispatch();
+ 				break;
+@@ -696,6 +705,8 @@ export class Session {
+ 			completion.reject(signal?.reason);
+ 			void connection.send({ type: "cancelRequest", id }).catch(() => {});
+ 		};
++		if (this.#requests.size >= ipcLimits.pendingPerPeer)
++			throw new Error("Session request capacity exceeded");
+ 		this.#requests.set(id, completion);
+ 		signal?.addEventListener("abort", onAbort, { once: true });
+ 		void connection
 diff --git a/src/state.ts b/src/state.ts
 index 117c658..b88f26e 100644
 --- a/src/state.ts

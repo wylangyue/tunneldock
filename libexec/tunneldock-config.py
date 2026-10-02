@@ -6,6 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 
@@ -112,6 +113,32 @@ def profile_info(path):
     print("http://" + addr)
 
 
+def runtime_snapshot(path):
+    """Display only validated, allowlisted fields from an explicitly stale snapshot."""
+    data = read_object(path)
+    statuses = {"starting", "online", "offline", "failed"}
+    codes = {"awaiting_handshake", "handshake_verified", "handshake_mismatch",
+             "inspection_mismatch", "ipc_disconnected", "cwd_unavailable", "pi_not_found", "permission_denied",
+             "spawn_failed", "process_stopped", "unexpected_exit", "broker_stopped",
+             "startup_timeout", "startup_failed"}
+    stderr_codes = {"no_diagnostic", "module_not_found", "syntax_error", "permission_denied",
+                    "extension_load_failed", "provider_unavailable"}
+    records = data.get("sessions")
+    if data.get("revision") != 1 or not isinstance(records, list) or len(records) > 256:
+        raise ValueError("runtime snapshot format is unavailable")
+    lines = []
+    for item in records:
+        sid, status, code = item.get("sessionId", ""), item.get("status"), item.get("code")
+        stderr_code = item.get("stderrCode", "no_diagnostic")
+        if (not isinstance(sid, str) or not re.fullmatch(r"[a-f0-9-]{36}", sid)
+                or status not in statuses or code not in codes or stderr_code not in stderr_codes):
+            raise ValueError("runtime snapshot record is invalid")
+        lines.append(f"{sid} {status} {code} stderr={stderr_code}")
+    print("Historical runtime snapshot (not live; broker health is unknown)")
+    for line in lines:
+        print(line)
+
+
 def main():
     command, *args = sys.argv[1:]
     if command == "migrate":
@@ -141,6 +168,8 @@ def main():
         print(health_address(args[0]))
     elif command == "profile-info":
         profile_info(args[0])
+    elif command == "runtime-snapshot":
+        runtime_snapshot(args[0])
     elif command == "profile-broker":
         import yaml
 

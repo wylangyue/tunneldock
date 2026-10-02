@@ -124,6 +124,25 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(address=address), self.assertRaises(ValueError):
                 config.health_address(address)
 
+    def test_historical_runtime_snapshot_only_displays_validated_fields(self):
+        path = self.root / "runtime.json"
+        record = {"sessionId": "00000000-0000-4000-8000-000000000001",
+                  "status": "failed", "code": "handshake_mismatch",
+                  "stderrCode": "extension_load_failed",
+                  "stderr": "synthetic-secret-must-not-display", "nonce": "synthetic-nonce"}
+        config.write_object(path, {"revision": 1, "sessions": [record]})
+        result = self.invoke("runtime-snapshot", path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not live", result.stdout)
+        self.assertIn("handshake_mismatch", result.stdout)
+        self.assertNotIn("synthetic-secret", result.stdout + result.stderr)
+        self.assertNotIn("synthetic-nonce", result.stdout + result.stderr)
+        record["code"] = "synthetic-secret-must-not-display"
+        config.write_object(path, {"revision": 1, "sessions": [record]})
+        result = self.invoke("runtime-snapshot", path)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("synthetic-secret", result.stdout + result.stderr)
+
 
 class CliTests(unittest.TestCase):
     def invoke(self, *args):
@@ -172,13 +191,14 @@ TUNNELDOCK_FORCE_OTUNNEL_SOURCE=1 install_otunnel
             profile.write_text(f'control_plane:\n  api_key: "file:{key}"\nhealth:\n  listen_addr: "127.0.0.1:18081"\n')
             config.write_object(root / "config.json", {"autoCreate": {"cwd": directory}})
             config.write_object(root / "package.json", {
-                "version": "1.1.0-tunneldock.1", "tunneldock": {"chatScopedSessions": 1}})
+                "version": "1.1.0-tunneldock.2", "tunneldock": {"chatScopedSessions": 1,
+                "runtimeHandshake": 1, "runtimeDiagnostics": 1, "ipcCapacity": 1}})
             script = '''source "$1"
 PROFILE_FILE="$2/profile.yaml"
 CHAPPIE_CONFIG="$2/config.json"
 CHAPPIE_DIR="$2"
 pi() { [[ "$1" == list ]] && echo "$CHAPPIE_DIR"; return 0; }
-chappie() { return 0; }
+chappie() { if [[ "$1" == diagnostics ]]; then echo LIVE_RUNTIME_DIAGNOSTICS; fi; return 0; }
 systemctl() { return 0; }
 loginctl() { echo yes; }
 otunnel() {
@@ -191,8 +211,20 @@ doctor_cmd
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("http://127.0.0.1:18081", result.stdout)
+            self.assertIn("LIVE_RUNTIME_DIAGNOSTICS", result.stdout)
             self.assertNotIn("UNEXPECTED_DEEP_DOCTOR", result.stdout)
             self.assertNotIn("synthetic-test-credential", result.stdout + result.stderr)
+            failed_runtime = script.replace("echo LIVE_RUNTIME_DIAGNOSTICS; fi;", "echo LIVE_RUNTIME_DIAGNOSTICS; return 1; fi;")
+            result = subprocess.run(["bash", "-c", failed_runtime, "test", str(ROOT / "bin/tunneldock"), directory],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("http://127.0.0.1:18081", result.stdout)
+            config.write_object(root / "package.json", {
+                "version": "1.1.0-tunneldock.1", "tunneldock": {"chatScopedSessions": 1}})
+            result = subprocess.run(["bash", "-c", script, "test", str(ROOT / "bin/tunneldock"), directory],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("FAIL  Managed runtime build", result.stdout)
 
     def test_install_restarts_previous_service_on_failure(self):
         script = '''source "$1"
@@ -223,6 +255,33 @@ validate_versions
     def test_install_help_and_unexpected_arguments_do_not_install(self):
         self.assertEqual(self.invoke("install", "--help").returncode, 0)
         self.assertEqual(self.invoke("install", "--unexpected").returncode, 1)
+
+    def test_diagnostics_offline_fallback_remains_an_explicit_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config.write_object(root / "runtime.json", {"revision": 1, "sessions": [{
+                "sessionId": "00000000-0000-4000-8000-000000000001", "status": "failed",
+                "code": "startup_timeout", "stderrCode": "no_diagnostic"}]})
+            script = '''source "$1"
+KEY_DIR="$2"
+chappie() { return 1; }
+diagnostics_cmd
+'''
+            result = subprocess.run(["bash", "-c", script, "test", str(ROOT / "bin/tunneldock"), directory],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("not live", result.stdout)
+            self.assertIn("startup_timeout", result.stdout)
+            result = subprocess.run(["bash", "-c", script.replace("diagnostics_cmd\n", "diagnostics_cmd --json\n"),
+                                     "test", str(ROOT / "bin/tunneldock"), directory], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout, "")
+
+    def test_diagnostics_rejects_unknown_options_without_runtime_work(self):
+        self.assertEqual(self.invoke("diagnostics", "--help").returncode, 0)
+        result = self.invoke("diagnostics", "--unexpected")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("仅接受 --json", result.stderr)
 
 
 if __name__ == "__main__":

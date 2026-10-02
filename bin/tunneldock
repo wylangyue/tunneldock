@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 NODE_VERSION="${TUNNELDOCK_NODE_VERSION:-26.10.0}"
 PI_VERSION="${TUNNELDOCK_PI_VERSION:-0.99.1}"
 CHAPPIE_VERSION="${TUNNELDOCK_CHAPPIE_VERSION:-1.1.0}"
@@ -10,7 +10,7 @@ OTUNNEL_VERSION="${TUNNELDOCK_OTUNNEL_VERSION:-0.2.0}"
 SCRIPT_DIR="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 PATCH_FILE="$ROOT_DIR/patches/chappie-${CHAPPIE_VERSION}-chat-scoped-sessions.patch"
-PATCH_REVISION=1
+PATCH_REVISION=2
 CHAPPIE_BUILD_VERSION="$CHAPPIE_VERSION-tunneldock.$PATCH_REVISION"
 PNPM_VERSION=12.4.1
 CONFIG_HELPER="$ROOT_DIR/libexec/tunneldock-config.py"
@@ -229,7 +229,7 @@ build_chappie() (
 const fs = require("node:fs");
 const pkg = JSON.parse(fs.readFileSync("package.json"));
 pkg.version = process.argv[2];
-pkg.tunneldock = { chatScopedSessions: 1 };
+pkg.tunneldock = { chatScopedSessions: 1, runtimeHandshake: 1, runtimeDiagnostics: 1, ipcCapacity: 1 };
 fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
 JS
 		# cli.js embeds package metadata, so rebuild with the local version.
@@ -453,7 +453,7 @@ doctor_cmd() {
 	check "otunnel runnable" otunnel --version
 	check "Chappie broker runnable" chappie --version
 	check "Pi Chappie extension registered" pi_chappie_registered
-	check "Chat-scoped session build" node --input-type=commonjs -e 'const p = require(process.argv[1]); if (p.version !== process.argv[2] || p.tunneldock?.chatScopedSessions !== 1) process.exit(1)' "$CHAPPIE_DIR/package.json" "$CHAPPIE_BUILD_VERSION"
+	check "Managed runtime build" node --input-type=commonjs -e 'const p = require(process.argv[1]); if (p.version !== process.argv[2] || ["chatScopedSessions", "runtimeHandshake", "runtimeDiagnostics", "ipcCapacity"].some(k => p.tunneldock?.[k] !== 1)) process.exit(1)' "$CHAPPIE_DIR/package.json" "$CHAPPIE_BUILD_VERSION"
 	check "Python YAML support" python3 -c 'import yaml'
 	check "Chappie autoCreate config" config_tool validate-sessions "$CHAPPIE_CONFIG"
 	check "systemd user bus" systemctl --user show-environment
@@ -476,12 +476,22 @@ doctor_cmd() {
 		printf 'WARN  systemd user linger disabled (SSH 注销后服务可能停止)\n'
 	fi
 	if systemctl --user is-active --quiet chappie-tunnel.service 2>/dev/null; then
+		if ! chappie diagnostics --check; then failed=1; fi
 		if [[ -z "$health_url" ]] || ! otunnel health --url "$health_url" --require-control-plane-poll; then failed=1; fi
 	else
 		# Upstream doctor may launch the broker: only invoke it on a valid profile.
 		if [[ -n "$health_url" ]] && ! otunnel doctor --profile chappie --profile-dir "$PROFILE_DIR" --explain; then failed=1; fi
 	fi
 	return "$failed"
+}
+
+diagnostics_cmd() {
+	if chappie diagnostics "$@"; then return; fi
+	if [[ $# -eq 0 && -f "$KEY_DIR/runtime.json" ]]; then
+		config_tool runtime-snapshot "$KEY_DIR/runtime.json"
+	fi
+	# A historical snapshot cannot establish current broker/Pi health.
+	return 1
 }
 
 logs_cmd() {
@@ -522,6 +532,7 @@ Usage:
   tunneldock start|stop|restart
   tunneldock status
   tunneldock doctor
+  tunneldock diagnostics [--json]
   tunneldock logs [N|-f]
   tunneldock sessions
   tunneldock update
@@ -544,6 +555,10 @@ main() {
 			if [[ $# -eq 1 && ( "$1" == --help || "$1" == -h ) ]]; then usage; return; fi
 			[[ $# -eq 0 ]] || die "$cmd 不接受额外参数"
 			;;
+		diagnostics)
+			if [[ $# -eq 1 && ( "$1" == --help || "$1" == -h ) ]]; then usage; return; fi
+			[[ $# -eq 0 || ( $# -eq 1 && "$1" == --json ) ]] || die "diagnostics 仅接受 --json"
+			;;
 	esac
 	case "$cmd" in
 		install) install_all "$@" ;;
@@ -554,6 +569,7 @@ main() {
 		restart) service_action restart ;;
 		status) status_cmd ;;
 		doctor) doctor_cmd ;;
+		diagnostics) diagnostics_cmd "$@" ;;
 		logs) logs_cmd "$@" ;;
 		sessions) sessions_cmd ;;
 		update) update_cmd ;;

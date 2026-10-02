@@ -4,14 +4,14 @@
 
 ## 当前版本与上游对齐
 
-2026-09-30 对照上游发布版本更新：
+2026-09-30 对照上游发布版本更新；2026-10-03 增加本地运行时可靠性改进：
 
 | 组件 | 默认版本 | 说明 |
 | --- | --- | --- |
-| TunnelDock | 0.2.0 | Linux CLI |
+| TunnelDock | 0.3.0 | Linux CLI，增加托管运行时握手、诊断和 IPC 容量限制 |
 | Node.js | 26.10.0 | 已有 Node >= 26 时保留现有版本 |
 | Pi coding agent | 0.99.1 | 已验证实际会话创建、历史恢复及空闲恢复 |
-| Chappie | 1.1.0-tunneldock.1 | 基于官方 1.1.0，保留独立会话补丁 |
+| Chappie | 1.1.0-tunneldock.2 | 基于官方 1.1.0，保留独立会话并校验托管运行时 |
 | otunnel | 0.2.0 | 使用官方 Linux GNU release，运行失败时本机编译 |
 | pnpm | 12.4.1 | 仅在临时目录用于构建 Chappie |
 
@@ -41,6 +41,8 @@ cd tunneldock
 export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
 configure-chappie-tunnel --tunnel-id tunnel_xxxxxxxxx
 tunneldock doctor
+tunneldock diagnostics
+tunneldock diagnostics --json
 ```
 
 安装需要可用的 systemd user bus。请通过正常登录用户运行；非 root 用户安装 apt 依赖时需要 sudo。
@@ -83,6 +85,8 @@ tunneldock stop
 tunneldock restart
 tunneldock status
 tunneldock doctor
+tunneldock diagnostics
+tunneldock diagnostics --json
 tunneldock logs           # 最近 100 行
 tunneldock logs 300
 tunneldock logs -f
@@ -93,7 +97,11 @@ tunneldock version
 
 `status` 显示组件版本及配置文件位置，不输出可能包含密码的 Chappie 配置。
 
-`doctor` 检查可运行组件、会话补丁构建标识、会话配置、systemd user bus，以及 profile 实际引用的凭据文件。退出码：0 表示通过；1 表示存在故障；2 表示组件检查通过但尚未配置 profile。
+`doctor` 检查可运行组件、会话与运行时补丁构建标识、会话配置、systemd user bus，以及 profile 实际引用的凭据文件。服务运行时还通过已有 broker 的 Unix socket 查询实时运行时诊断；托管会话启动未完成或本次 broker 运行中仍有失败记录时返回失败，成功重试同一会话会清除该会话的失败状态。退出码：0 表示检查通过；1 表示存在故障；2 表示组件检查通过但尚未配置 profile。
+
+没有在线托管 Pi 时，诊断明确提示未核查在线 Pi 握手；不会为检查而创建会话或启动第二个 broker。此时退出码 0 仅表示其余组件、broker 和 tunnel 检查通过。
+
+`diagnostics` 显示实时 broker、托管 Pi 的启动/在线/离线/失败状态，以及在线会话的执行状态和错误分类。`--json` 输出结构化实时快照；退出码 0 表示查询成功，具体健康状态需检查内容。broker 不可达时退出码为 1，普通输出会尝试显示 `~/.chappie/runtime.json` 历史快照，并明确标为非实时；JSON 模式不会用历史快照代替实时数据。
 
 服务运行时，诊断调用现有健康探针并要求 control-plane poll 成功。服务停止且 profile/凭据检查通过时，才运行完整 `otunnel doctor`，避免启动第二个 broker 导致端口/socket 冲突。服务停止本身仍属于诊断失败。
 
@@ -107,6 +115,25 @@ tunneldock version
 - 显式 `sessionId` 仍可切换或共享会话；执行工具的显式目标只影响该次操作，`init` 修改默认绑定。
 - 默认空闲 30 分钟退出进程，保留历史和绑定；正在执行或生成的会话不会被空闲回收。
 - 启动失败可按原绑定重试；调用取消会及时返回，正在共享的启动仍可完成。
+
+托管 Pi 上线前必须完成运行时握手与工具目录核查：本次启动 nonce、session ID、规范化 cwd、`chappie/chatgpt` provider、扩展构建版本、协议 revision、Pi/Node 版本格式、必需能力，以及包含 `read` 的实际工具目录。Pi 报告运行版本，协议和能力负责兼容性判断；不要求另行登录模型服务商。启动及核查合计最长 30 秒，失败后回收进程，保留原绑定供重试。并发调用必须等待共享启动核查完成；nonce 不出现在对外会话信息或诊断中。手动连接的非托管会话保持原有接入语义。
+
+Pi stderr 最多检查前 64 KiB，只输出 `module_not_found`、`extension_load_failed`、`syntax_error` 等固定分类，不输出或持久化原始文本、环境变量和 transcript。未知错误显示 `no_diagnostic`，不代表没有错误。诊断快照采用 0600 权限和原子替换，最多保存本次 broker 运行中最近 256 个托管会话状态；重启后重新建立实时状态。握手和诊断用于运行可靠性，不构成操作系统沙箱。
+
+IPC 默认容量如下，消息大小按 UTF-8 字节计算：
+
+| 范围 | 上限 | 超限行为 |
+| --- | --- | --- |
+| 单条 JSON 帧，不含换行 | 16 MiB | 入站关闭该连接；出站拒绝该发送 |
+| 每条连接尚未完成的写入，含换行 | 32 MiB | 拒绝该发送 |
+| 每条连接待处理帧与未完成帧的合计大小，不含换行 | 32 MiB | 关闭该连接 |
+| 每条连接同时处理的帧 | 64 | 关闭该连接 |
+| broker IPC 连接 | 64 | 拒绝新增连接 |
+| broker 待完成请求 | 每个目标 peer 64，总计 256 | 拒绝新增请求 |
+| 每个来源 peer 的转发请求、Session 发起的请求 | 64 | 拒绝新增请求 |
+| 每个会话排队的 chat/call | 64 条且合计 16 MiB | 返回明确错误，保留已接收请求 |
+
+IPC 消息处理保持可并行进入，避免一个正在等待回复的请求阻塞同一连接上的回复或取消。取消排队请求会释放队列容量。异常断连的托管会话标为失败并回收进程，下一次访问按原 ID 恢复。大文件分块传输仍遵循单帧限制，过大的内联图片或结果需要缩小或改用分块/资源引用。
 
 默认配置位于 `~/.chappie/config.json`：
 
@@ -203,10 +230,10 @@ git diff --check
 对 Chappie v1.1.0 应用新 patch 并按其 frozen lockfile 准备依赖后，可运行 broker 回归：
 
 ```bash
-CHAPPIE_SOURCE_DIR=/path/to/patched/chappie node --test tests/chappie.test.mjs
+CHAPPIE_SOURCE_DIR=/path/to/patched/chappie node --test tests/chappie.test.mjs tests/chappie-ipc.test.mjs
 ```
 
-增加真实 Pi 集成测试时，设置 `CHAPPIE_PI_BIN` 为隔离安装的 Pi 0.99.1 可执行文件路径、`CHAPPIE_PACKAGE_DIR` 为已构建安装的 Chappie 包目录。测试只在临时目录运行，涵盖独立对话、并发、共享、失败重试、取消、空闲回收、忙碌保护和 transcript 恢复。
+增加真实 Pi 集成测试时，设置 `CHAPPIE_PI_BIN` 为隔离安装的 Pi 0.99.1 可执行文件路径、`CHAPPIE_PACKAGE_DIR` 为已构建安装的 Chappie 包目录。测试只在临时目录运行，涵盖独立对话、并发、共享、失败重试、取消、空闲回收、忙碌保护、transcript 恢复、握手不匹配、30 秒启动超时、诊断脱敏、IPC 帧/写入/连接/请求预算及队列超限后的取消。源码 checkout 与构建包的 `package.json` 版本必须一致。设置 `CHAPPIE_CLI_BIN` 为构建包的 `chappie` 可执行文件路径，可额外验证打包后的诊断命令。启动超时测试需要约 30 秒。
 
 部署后人工验证：新建 ChatGPT 对话 A/B，确认两个 session ID 不同；返回 A 确认恢复原 ID；执行 `tunneldock sessions` 查看绑定。真实 OpenAI control plane、Restricted API Key 和 ChatGPT 宿主对话行为需在实际部署中验证。
 

@@ -154,7 +154,10 @@ test("startup failure can retry the persisted binding", async t => {
   const f = await fixture(t);
   process.env.TEST_FAIL_START = "1";
   const broker = await f.start();
-  await assert.rejects(broker.initialize("a", undefined, 1, signal()), /exited/);
+  await assert.rejects(broker.initialize("a", undefined, 1, signal()), /startup_failed/);
+  const failed = broker.runtimeDiagnostics().sessions.find(item => item.sessionId === broker.binding("a"));
+  assert.equal(failed.code, "startup_failed");
+  assert.equal(failed.stderrCode, "module_not_found");
   const id = broker.binding("a");
   delete process.env.TEST_FAIL_START;
   const a = await broker.initialize("a", undefined, 2, signal());

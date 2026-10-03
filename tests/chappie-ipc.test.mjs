@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter, once } from "node:events";
 import { mkdtemp, mkdir, rm } from "node:fs/promises";
-import { createConnection } from "node:net";
+import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -216,4 +216,53 @@ test("session queue overflow rejects that operation and still accepts cancellati
   await owner.send(chat(2002));
   await delay(30);
   assert.equal(results.length, 2, "cancel released the byte budget");
+});
+
+test("startup settling releases queued UTF-8 bytes before a large retry", async t => {
+  let owner;
+  let wakeCount = 0;
+  const results = [];
+  const server = createServer(socket => {
+    owner = new JsonLinePeer(socket, async message => {
+      if (message.type === "sync") {
+        await owner.send({ type: "synced", id: message.id, sessionId: message.session.id });
+      }
+      if (message.type === "result") results.push(message);
+    }, () => {});
+  });
+  let session;
+  t.after(async () => {
+    session?.close();
+    owner?.close();
+    await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  session = new Session({
+    describe: () => ({ id: "settled-test", agent: "pi", cwd: tmpdir(), device: "fixture" }),
+    active: () => true, isIdle: () => true, inspect: async () => ({ tools: [], skills: [] }),
+    inputs: () => [], resetInputs: () => {}, wake: () => { wakeCount++; }, abort: () => {},
+    history: async () => ({ count: 0, hasMore: false, content: [] }),
+  }, { connect: `127.0.0.1:${server.address().port}` });
+  async function until(predicate) {
+    for (let i = 0; i < 200; i++) {
+      if (predicate()) return;
+      await delay(10);
+    }
+    throw new Error("condition did not become true");
+  }
+  session.update();
+  await until(() => owner !== undefined);
+  const chat = id => ({ type: "chat", id, sessionId: "settled-test", clientId: "fixture",
+    label: "fixture", text: "界".repeat(3 * 1024 * 1024) });
+  const bytes = Buffer.byteLength(JSON.stringify([chat(1)]));
+  assert.ok(bytes < ipcLimits.sessionQueueBytes && bytes * 2 > ipcLimits.sessionQueueBytes);
+  for (const id of [1, 2]) {
+    await owner.send(chat(id));
+    await until(() => wakeCount === id || results.some(result => result.id === id));
+    assert.equal(wakeCount, id, "removed requests must release the byte budget for retries");
+    await session.settled(new Error("synthetic startup failure"));
+    await until(() => results.some(result => result.id === id));
+    assert.equal(results.find(result => result.id === id).error, "synthetic startup failure");
+  }
 });

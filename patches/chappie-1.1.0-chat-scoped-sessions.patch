@@ -1,5 +1,5 @@
 diff --git a/src/broker.ts b/src/broker.ts
-index 698860b..5f36b8d 100644
+index 698860b..bd419ca 100644
 --- a/src/broker.ts
 +++ b/src/broker.ts
 @@ -1,5 +1,8 @@
@@ -366,7 +366,7 @@ index 698860b..5f36b8d 100644
  					? await this.#join(chatId, target, requestId, signal, bindRequested)
  					: undefined;
  			return {
-@@ -633,6 +860,263 @@ export class Broker {
+@@ -633,6 +860,265 @@ export class Broker {
  		}
  	}
  
@@ -483,7 +483,9 @@ index 698860b..5f36b8d 100644
 +					? previousDiagnostic.code
 +					: processRecord.stopping
 +						? "process_stopped"
-+						: "unexpected_exit",
++						: previousDiagnostic?.status === "starting"
++							? "startup_failed"
++							: "unexpected_exit",
 +			);
 +			const diagnostic = this.#diagnostics.get(sessionId);
 +			if (diagnostic) {
@@ -492,7 +494,7 @@ index 698860b..5f36b8d 100644
 +			}
 +			if (!processRecord.stopping)
 +				console.error(
-+					`[tunneldock] Managed Pi session ${sessionId}: unexpected_exit`,
++					`[tunneldock] Managed Pi session ${sessionId}: ${diagnostic?.code ?? "unexpected_exit"}`,
 +				);
 +			if (processRecord.idleTimer) clearTimeout(processRecord.idleTimer);
 +			if (this.#managedProcesses.get(sessionId) === processRecord)
@@ -630,7 +632,7 @@ index 698860b..5f36b8d 100644
  	async #join(
  		chatId: string,
  		sessionId: string,
-@@ -696,13 +1180,23 @@ export class Broker {
+@@ -696,13 +1182,23 @@ export class Broker {
  	async #inspect(
  		sessionId: string,
  		signal: AbortSignal,
@@ -655,7 +657,7 @@ index 698860b..5f36b8d 100644
  		throw new Error("Session returned no inspection");
  	}
  
-@@ -738,6 +1232,12 @@ export class Broker {
+@@ -738,6 +1234,12 @@ export class Broker {
  			throw new Error(
  				`Session resource or target is unavailable: ${sessionId}`,
  			);
@@ -668,7 +670,7 @@ index 698860b..5f36b8d 100644
  		const completion = Promise.withResolvers<SessionResult>();
  		const onAbort = (): void => {
  			const pending = this.#pending.get(id);
-@@ -766,7 +1266,9 @@ export class Broker {
+@@ -766,7 +1268,9 @@ export class Broker {
  			this.#finishRequest(id, pending);
  			pending.reject(error instanceof Error ? error : new Error(String(error)));
  		});
@@ -679,7 +681,7 @@ index 698860b..5f36b8d 100644
  	}
  
  	#waitForChange(signal: AbortSignal): Promise<void> {
-@@ -819,6 +1321,11 @@ export class Broker {
+@@ -819,6 +1323,11 @@ export class Broker {
  	}
  
  	#removeSession(sessionId: string): void {
@@ -691,7 +693,7 @@ index 698860b..5f36b8d 100644
  		this.#sessions.delete(sessionId);
  		this.#notifyChange();
  	}
-@@ -831,3 +1338,10 @@ function abortError(signal: AbortSignal): Error {
+@@ -831,3 +1340,10 @@ function abortError(signal: AbortSignal): Error {
  				typeof signal.reason === "string" ? signal.reason : "Request cancelled",
  			);
  }
@@ -1278,7 +1280,7 @@ index 7c68f2c..31bf78d 100644
  			}),
  			annotations: toolAnnotations,
 diff --git a/src/session.ts b/src/session.ts
-index e1c0d54..2ee1f02 100644
+index e1c0d54..c925f12 100644
 --- a/src/session.ts
 +++ b/src/session.ts
 @@ -33,6 +33,7 @@ import {
@@ -1289,22 +1291,73 @@ index e1c0d54..2ee1f02 100644
  import type { ToolInput } from "./tools.ts";
  
  type RemoteRequest = Extract<BrokerMessage, { type: "chat" | "call" }>;
-@@ -654,6 +655,14 @@ export class Session {
+@@ -63,6 +64,8 @@ export class Session {
+ 		{ output: Output; request: ModelRequest }
+ 	>();
+ 	readonly #queue: RemoteRequest[] = [];
++	readonly #queueSizes = new WeakMap<RemoteRequest, number>();
++	#queuePayloadBytes = 0;
+ 	readonly #pendingInputs = new Map<string, SessionInput>();
+ 	readonly #deliveries = new Map<string, DeliveryRecord>();
+ 	readonly #histories = new Map<number, HistoryRequest>();
+@@ -228,7 +231,7 @@ export class Session {
+ 			active.completed = true;
+ 			active.error = reason;
+ 		} else if (!active && starting) {
+-			const request = this.#queue.shift();
++			const request = this.#shiftQueued();
+ 			if (request) await this.#sendError(request.id, reason);
+ 		}
+ 		this.#collectInputs();
+@@ -291,7 +294,7 @@ export class Session {
+ 			await this.#completeActive();
+ 			output.begin();
+ 			await this.#sync();
+-			for (const queued of this.#queue.splice(0))
++			for (const queued of this.#drainQueue())
+ 				await this.#cancelPending(queued);
+ 			await output.finished;
+ 		} finally {
+@@ -395,7 +398,7 @@ export class Session {
+ 		this.#generations.clear();
+ 		this.#output = undefined;
+ 		this.#active = undefined;
+-		this.#queue.length = 0;
++		this.#clearQueue();
+ 		this.#starting = false;
+ 		this.#connection?.close();
+ 		this.#connection = undefined;
+@@ -435,7 +438,7 @@ export class Session {
+ 					for (const { output } of this.#generations.values())
+ 						output.fail(error);
+ 					this.#active = undefined;
+-					this.#queue.length = 0;
++					this.#clearQueue();
+ 					this.#starting = false;
+ 				},
+ 			});
+@@ -607,7 +610,7 @@ export class Session {
+ 					},
+ 				);
+ 				if (queued !== -1) {
+-					this.#queue.splice(queued, 1);
++					this.#removeQueued(queued);
+ 					break;
+ 				}
+ 				const active = this.#active;
+@@ -654,7 +657,10 @@ export class Session {
  					await this.#cancelPending(message);
  					break;
  				}
-+				if (
-+					this.#queue.length >= ipcLimits.sessionQueue ||
-+					Buffer.byteLength(JSON.stringify([...this.#queue, message])) >
-+						ipcLimits.sessionQueueBytes
-+				) {
+-				this.#queue.push(message);
++				if (!this.#enqueue(message)) {
 +					await this.#sendError(message.id, "Session queue capacity exceeded");
 +					break;
 +				}
- 				this.#queue.push(message);
  				this.#dispatch();
  				break;
-@@ -696,6 +705,8 @@ export class Session {
+ 		}
+@@ -696,6 +702,8 @@ export class Session {
  			completion.reject(signal?.reason);
  			void connection.send({ type: "cancelRequest", id }).catch(() => {});
  		};
@@ -1313,6 +1366,78 @@ index e1c0d54..2ee1f02 100644
  		this.#requests.set(id, completion);
  		signal?.addEventListener("abort", onAbort, { once: true });
  		void connection
+@@ -801,6 +809,53 @@ export class Session {
+ 		this.#histories.delete(id);
+ 	}
+ 
++	#enqueue(request: RemoteRequest): boolean {
++		const bytes = Buffer.byteLength(JSON.stringify(request));
++		const arrayBytes = 2 + this.#queuePayloadBytes + bytes + this.#queue.length;
++		if (
++			this.#queue.length >= ipcLimits.sessionQueue ||
++			arrayBytes > ipcLimits.sessionQueueBytes
++		)
++			return false;
++		this.#queue.push(request);
++		this.#queueSizes.set(request, bytes);
++		this.#queuePayloadBytes += bytes;
++		return true;
++	}
++
++	#shiftQueued(): RemoteRequest | undefined {
++		const request = this.#queue.shift();
++		if (request) this.#releaseQueued(request);
++		return request;
++	}
++
++	#removeQueued(index: number): RemoteRequest | undefined {
++		const [request] = this.#queue.splice(index, 1);
++		if (request) this.#releaseQueued(request);
++		return request;
++	}
++
++	#drainQueue(): RemoteRequest[] {
++		const queued = this.#queue.splice(0);
++		this.#queuePayloadBytes = 0;
++		for (const request of queued) this.#queueSizes.delete(request);
++		return queued;
++	}
++
++	#clearQueue(): void {
++		for (const request of this.#queue) this.#queueSizes.delete(request);
++		this.#queue.length = 0;
++		this.#queuePayloadBytes = 0;
++	}
++
++	#releaseQueued(request: RemoteRequest): void {
++		const bytes = this.#queueSizes.get(request);
++		if (bytes !== undefined) {
++			this.#queuePayloadBytes -= bytes;
++			this.#queueSizes.delete(request);
++		}
++	}
++
+ 	#dispatch(): void {
+ 		if (this.#active || this.#generations.size) return;
+ 		const output = this.#output;
+@@ -809,7 +864,7 @@ export class Session {
+ 			return;
+ 		}
+ 
+-		const request = this.#queue.shift();
++		const request = this.#shiftQueued();
+ 		if (!request) return;
+ 		output.message.chappie = source(
+ 			request.clientId,
+@@ -850,7 +905,7 @@ export class Session {
+ 			.catch((error: unknown) => {
+ 				this.#starting = false;
+ 				this.#rejectReady(error);
+-				const request = this.#queue.shift();
++				const request = this.#shiftQueued();
+ 				if (request)
+ 					return this.#sendError(
+ 						request.id,
 diff --git a/src/state.ts b/src/state.ts
 index 117c658..b88f26e 100644
 --- a/src/state.ts

@@ -11,7 +11,7 @@
 | TunnelDock | 0.3.0 | Linux CLI，增加托管运行时握手、诊断和 IPC 容量限制 |
 | Node.js | 26.10.0 | 已有 Node >= 26 时保留现有版本 |
 | Pi coding agent | 0.99.1 | 已验证实际会话创建、历史恢复及空闲恢复 |
-| Chappie | 1.1.0-tunneldock.2 | 基于官方 1.1.0，保留独立会话并校验托管运行时 |
+| Chappie | 1.1.0-tunneldock.3 | 基于官方 1.1.0，保留独立会话并校验托管运行时 |
 | otunnel | 0.2.0 | 使用官方 Linux GNU release，运行失败时本机编译 |
 | pnpm | 12.4.1 | 仅在临时目录用于构建 Chappie |
 

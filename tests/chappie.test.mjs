@@ -56,7 +56,7 @@ if (process.env.TEST_FAIL_START === "1") {
 }
 const socket = createConnection(process.env.HOME + "/.chappie/broker.sock");
 const runtime = { revision: 1, nonce: process.env.TUNNELDOCK_PI_NONCE,
- extensionBuild: ${JSON.stringify(extensionBuild)}, piVersion: "0.99.1", nodeVersion: process.versions.node,
+ extensionBuild: ${JSON.stringify(extensionBuild)}, piVersion: "0.99.2", nodeVersion: process.versions.node,
  capabilities: ${JSON.stringify(runtimeCapabilities)}, tools: ["read"] };
 const session = { id: sid, cwd: process.cwd(), agent: "pi", model: "chappie/chatgpt", runtime,
  device: "fixture", status: process.env.TEST_STATUS ?? "ready" };
@@ -323,7 +323,7 @@ test("packaged diagnostics CLI queries the live broker and exposes check failure
   });
 });
 
-test("real Pi 0.99.1 persists transcript and restores it across broker restarts", {
+test("real Pi 0.99.2 persists transcript and restores it across broker restarts", {
   skip: !process.env.CHAPPIE_PI_BIN,
 }, async t => {
   const f = await fixture(t, { real: true, idleMinutes: 0.01 });

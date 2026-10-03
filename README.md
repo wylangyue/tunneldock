@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | TunnelDock | 0.3.0 | Linux CLI，增加托管运行时握手、诊断和 IPC 容量限制 |
 | Node.js | 26.10.0 | 已有 Node >= 26 时保留现有版本 |
-| Pi coding agent | 0.99.1 | 已验证实际会话创建、历史恢复及空闲恢复 |
+| Pi coding agent | 0.99.2 | 已验证实际会话创建、历史恢复及空闲恢复 |
 | Chappie | 1.1.0-tunneldock.3 | 基于官方 1.1.0，保留独立会话并校验托管运行时 |
 | otunnel | 0.2.0 | 使用官方 Linux GNU release，运行失败时本机编译 |
 | pnpm | 12.4.1 | 仅在临时目录用于构建 Chappie |
@@ -233,7 +233,7 @@ git diff --check
 CHAPPIE_SOURCE_DIR=/path/to/patched/chappie node --test tests/chappie.test.mjs tests/chappie-ipc.test.mjs
 ```
 
-增加真实 Pi 集成测试时，设置 `CHAPPIE_PI_BIN` 为隔离安装的 Pi 0.99.1 可执行文件路径、`CHAPPIE_PACKAGE_DIR` 为已构建安装的 Chappie 包目录。测试只在临时目录运行，涵盖独立对话、并发、共享、失败重试、取消、空闲回收、忙碌保护、transcript 恢复、握手不匹配、30 秒启动超时、诊断脱敏、IPC 帧/写入/连接/请求预算及队列超限后的取消。源码 checkout 与构建包的 `package.json` 版本必须一致。设置 `CHAPPIE_CLI_BIN` 为构建包的 `chappie` 可执行文件路径，可额外验证打包后的诊断命令。启动超时测试需要约 30 秒。
+增加真实 Pi 集成测试时，设置 `CHAPPIE_PI_BIN` 为隔离安装的 Pi 0.99.2 可执行文件路径、`CHAPPIE_PACKAGE_DIR` 为已构建安装的 Chappie 包目录。测试只在临时目录运行，涵盖独立对话、并发、共享、失败重试、取消、空闲回收、忙碌保护、transcript 恢复、握手不匹配、30 秒启动超时、诊断脱敏、IPC 帧/写入/连接/请求预算及队列超限后的取消。源码 checkout 与构建包的 `package.json` 版本必须一致。设置 `CHAPPIE_CLI_BIN` 为构建包的 `chappie` 可执行文件路径，可额外验证打包后的诊断命令。启动超时测试需要约 30 秒。
 
 部署后人工验证：新建 ChatGPT 对话 A/B，确认两个 session ID 不同；返回 A 确认恢复原 ID；执行 `tunneldock sessions` 查看绑定。真实 OpenAI control plane、Restricted API Key 和 ChatGPT 宿主对话行为需在实际部署中验证。
 

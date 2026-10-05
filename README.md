@@ -289,7 +289,7 @@ node tests/run-e2e.mjs --pi-version 0.99.2 --temp-dir /path/to/test-disk
 
 同日 `.6` / `0.4.1` 验证记录：干净上游重建后，Pi `0.99.1`、`0.99.2` 各通过 44 项测试，零失败、零跳过；20 项配置测试、TypeScript、Biome、ShellCheck、shell 语法和 diff 检查通过。新增覆盖初始化快照并发/取消、失败写入的状态回退、旧 transcript 重建 metadata 后保持 ID 和历史、缺失目标清理，以及歧义/损坏扫描时保留绑定。用户对 `.5` 的现场复核确认 `/home/reyin` 下 write/read/edit/bash/文件导出执行链正常；`.6` 的改动针对剩余的会话一致性问题。
 
-2026-10-05 10:17（Asia/Shanghai）生产已部署 `.6`（代码 `059acfd`，标签 `v0.4.1`），Pi 保持 `0.99.2`。待部署 archive 的 3 项真实 Pi 测试通过，安装的 30 个文件与 archive 逐字节一致。停机后状态为 27 个绑定、23 个 managed sessions；启动修复移除了指向 `01a0dd13-eb66-7026-bc76-54875bba982c` 的一条无 transcript 绑定，修复后为 26 个绑定、23 个 managed sessions、零悬空目标。其余原有绑定及 cwd/名称/归档状态均保留；未绑定的 `a25aa654-057c-4b52-bf3d-42ae5651bbdf` 仍保留。服务、broker `.6`、健康探针和 control-plane 轮询验证通过。重启前的 `.5` 现场 Pi handshake 正常；重启后暂无 managed Pi 在线，新的 `.6` 宿主并发初始化验收仍需实际 ChatGPT 请求验证。
+2026-10-05 10:17（Asia/Shanghai）生产已部署 `.6`（代码 `059acfd`，标签 `v0.4.1`），Pi 保持 `0.99.2`。待部署 archive 的 3 项真实 Pi 测试通过，安装的 30 个文件与 archive 逐字节一致。停机后状态为 27 个绑定、23 个 managed sessions；启动修复移除了指向 `01a0dd13-eb66-7026-bc76-54875bba982c` 的一条无 transcript 绑定，修复后为 26 个绑定、23 个 managed sessions、零悬空目标。其余原有绑定及 cwd/名称/归档状态均保留；未绑定的 `a25aa654-057c-4b52-bf3d-42ae5651bbdf` 仍保留。服务、broker `.6`、健康探针和 control-plane 轮询验证通过。随后生产出现一个正常的新 managed session，状态再次核对为 27 个绑定、24 个 managed sessions、零悬空目标，`.6` 现场 Pi `0.99.2` handshake 验证通过。宿主并发首次查询的响应顺序仍需专门现场复核，不把隔离测试视作这项宿主验收。
 
 ## 文件布局与许可
 

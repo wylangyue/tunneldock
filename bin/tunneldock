@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="0.4.0"
+VERSION="0.4.1"
 NODE_VERSION="${TUNNELDOCK_NODE_VERSION:-26.10.0}"
 PI_VERSION="${TUNNELDOCK_PI_VERSION:-0.99.2}"
 CHAPPIE_VERSION="${TUNNELDOCK_CHAPPIE_VERSION:-1.1.0}"
@@ -10,7 +10,7 @@ OTUNNEL_VERSION="${TUNNELDOCK_OTUNNEL_VERSION:-0.2.0}"
 SCRIPT_DIR="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 PATCH_FILE="$ROOT_DIR/patches/chappie-${CHAPPIE_VERSION}-chat-scoped-sessions.patch"
-PATCH_REVISION=5
+PATCH_REVISION=6
 CHAPPIE_BUILD_VERSION="$CHAPPIE_VERSION-tunneldock.$PATCH_REVISION"
 PNPM_VERSION=12.4.1
 CONFIG_HELPER="$ROOT_DIR/libexec/tunneldock-config.py"
@@ -229,7 +229,7 @@ build_chappie() (
 const fs = require("node:fs");
 const pkg = JSON.parse(fs.readFileSync("package.json"));
 pkg.version = process.argv[2];
-pkg.tunneldock = { chatScopedSessions: 1, runtimeHandshake: 1, runtimeDiagnostics: 1, ipcCapacity: 1, directTools: 1, offlineDiscovery: 1, projectSessions: 1, cwdSelection: 1, structuredErrors: 1, sessionLifecycle: 1 };
+pkg.tunneldock = { chatScopedSessions: 1, runtimeHandshake: 1, runtimeDiagnostics: 1, ipcCapacity: 1, directTools: 1, offlineDiscovery: 1, projectSessions: 1, cwdSelection: 1, structuredErrors: 1, sessionLifecycle: 1, selectionSnapshots: 1, bindingConsistency: 1 };
 fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
 JS
 		# cli.js embeds package metadata, so rebuild with the local version.

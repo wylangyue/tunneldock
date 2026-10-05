@@ -1,5 +1,5 @@
 diff --git a/src/broker.ts b/src/broker.ts
-index 698860b..c64ce65 100644
+index 698860b..2dae48f 100644
 --- a/src/broker.ts
 +++ b/src/broker.ts
 @@ -1,8 +1,12 @@
@@ -16,7 +16,7 @@ index 698860b..c64ce65 100644
  import { type HistoryRange, historyInstructions } from "./history.ts";
  import type { ToolCall, ToolResultMessage } from "./host.ts";
  import {
-@@ -24,7 +28,14 @@ import {
+@@ -24,7 +28,19 @@ import {
  	questionView,
  } from "./questions.ts";
  import { type ResourceData, resourceSessionId } from "./resources.ts";
@@ -28,11 +28,16 @@ index 698860b..c64ce65 100644
 +	StartupDiagnostics,
 +	validManagedRuntime,
 +} from "./runtime.ts";
++import {
++	findSavedPiSessions,
++	piSessionId,
++	verifySavedPiSession,
++} from "./saved-sessions.ts";
 +import { type ManagedSessionRecord, State } from "./state.ts";
  import type { ToolInput } from "./tools.ts";
  
  const observerInstructions =
-@@ -37,6 +48,7 @@ interface RegisteredSession {
+@@ -37,6 +53,7 @@ interface RegisteredSession {
  
  interface PendingRequest {
  	peer: JsonLinePeer<SessionMessage, BrokerMessage>;
@@ -40,7 +45,7 @@ index 698860b..c64ce65 100644
  	resolve(result: SessionResult): void;
  	reject(error: Error): void;
  	signal: AbortSignal;
-@@ -50,11 +62,46 @@ interface ChangeWaiter {
+@@ -50,11 +67,46 @@ interface ChangeWaiter {
  	onAbort(): void;
  }
  
@@ -87,7 +92,7 @@ index 698860b..c64ce65 100644
  export interface InitializedSession extends Omit<SessionInspection, "tools"> {
  	selection: "existing" | "explicit" | "automatic";
  	initialization?: Initialization;
-@@ -92,6 +139,31 @@ export class Broker {
+@@ -92,12 +144,40 @@ export class Broker {
  	readonly #pending = new Map<number, PendingRequest>();
  	readonly #waiters = new Set<ChangeWaiter>();
  	readonly #cooldowns = new Map<string, number>();
@@ -119,7 +124,16 @@ index 698860b..c64ce65 100644
  	readonly #relays = new Map<
  		JsonLinePeer<SessionMessage, BrokerMessage>,
  		Map<number, AbortController>
-@@ -111,13 +183,31 @@ export class Broker {
+ 	>();
+ 	#config: Config = {};
+ 	#nextRequestId = 1;
++	#snapshotRevision = 0;
++	readonly #selectionFlights = new Map<string, Set<Promise<void>>>();
++	readonly #implicitCreates = new Map<string, Promise<string>>();
+ 
+ 	constructor(directory: string) {
+ 		this.#directory = directory;
+@@ -111,13 +191,52 @@ export class Broker {
  
  	async start(): Promise<void> {
  		this.#config = await readConfig(this.#directory);
@@ -142,6 +156,27 @@ index 698860b..c64ce65 100644
 +		}
 +		await mkdir(this.#directory, { recursive: true, mode: 0o700 });
  		await this.#state.load();
++		if (this.#autoCreate && !this.#config.connect) {
++			const targets = new Set(
++				this.#state.unresolvedTargets().filter((id) => piSessionId.test(id)),
++			);
++			const saved = await findSavedPiSessions(
++				process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"),
++				targets,
++			);
++			const recovered = new Map<string, ManagedSessionRecord>();
++			const missing = new Set<string>();
++			for (const [id, result] of saved) {
++				if (result.status === "found") recovered.set(id, result.metadata);
++				else if (result.status === "missing") missing.add(id);
++			}
++			if (recovered.size || missing.size) {
++				await this.#state.reconcile(recovered, missing);
++				console.error(
++					`[tunneldock] Binding reconciliation: recovered=${recovered.size} removedTargets=${missing.size}`,
++				);
++			}
++		}
  		await this.#ipc.start(this.#config.listen ?? false);
 +		this.#persistDiagnostics();
  	}
@@ -152,7 +187,7 @@ index 698860b..c64ce65 100644
  		this.#cooldowns.clear();
  		for (const relays of this.#relays.values()) {
  			for (const controller of relays.values()) controller.abort(error);
-@@ -132,9 +222,101 @@ export class Broker {
+@@ -132,9 +251,102 @@ export class Broker {
  			waiter.reject(error);
  		}
  		this.#waiters.clear();
@@ -192,6 +227,7 @@ index 698860b..c64ce65 100644
 +	}
 +
 +	#recordDiagnostic(sessionId: string, status: string, code: string): void {
++		this.#snapshotRevision++;
 +		const managed = this.#managedProcesses.get(sessionId);
 +		const runtime = this.#sessions.get(sessionId)?.description.runtime;
 +		const previous =
@@ -254,7 +290,7 @@ index 698860b..c64ce65 100644
  	}
  
  	listSessions(sessionId?: string): (SessionDescription & {
-@@ -144,7 +326,7 @@ export class Broker {
+@@ -144,7 +356,7 @@ export class Broker {
  		return [...this.#sessions.values()]
  			.filter(({ description }) => !sessionId || description.id === sessionId)
  			.map(({ description }) => ({
@@ -263,7 +299,7 @@ index 698860b..c64ce65 100644
  				bindingCount: counts.get(description.id) ?? 0,
  			}));
  	}
-@@ -153,6 +335,157 @@ export class Broker {
+@@ -153,6 +365,258 @@ export class Broker {
  		return this.#config.ask ?? true;
  	}
  
@@ -297,7 +333,21 @@ index 698860b..c64ce65 100644
 +				bindingCount: counts.get(id) ?? 0,
 +				...this.#lifecycleMetadata(id),
 +			}));
-+		return [...online, ...offline];
++		const external = this.#state
++			.externalSessions()
++			.filter(
++				([id]) => (!sessionId || id === sessionId) && !this.#sessions.has(id),
++			)
++			.map(([id, metadata]) => ({
++				...metadata,
++				id,
++				online: false,
++				managed: false,
++				status: "offline",
++				bindingCount: counts.get(id) ?? 0,
++				archived: false,
++			}));
++		return [...online, ...offline, ...external];
 +	}
 +
 +	#lifecycleMetadata(id: string) {
@@ -344,6 +394,93 @@ index 698860b..c64ce65 100644
 +			total: matching.length,
 +			nextOffset: offset + limit < matching.length ? offset + limit : null,
 +		};
++	}
++
++	async waitForSelection(chatId: string, signal: AbortSignal): Promise<void> {
++		for (;;) {
++			signal.throwIfAborted();
++			const flights = this.#selectionFlights.get(chatId);
++			const bound = this.binding(chatId);
++			const starting = bound ? this.#managedStarts.get(bound) : undefined;
++			if (!flights?.size && !starting) return;
++			await this.#awaitSelection(
++				Promise.all([
++					...(flights ?? []),
++					...(starting ? [starting.catch(() => {})] : []),
++				]),
++				signal,
++			);
++		}
++	}
++
++	async sessionSnapshot(
++		chatId: string,
++		sessionId: string | undefined,
++		filter: SessionFilter,
++		signal: AbortSignal,
++	) {
++		for (;;) {
++			await this.waitForSelection(chatId, signal);
++			const revision = this.#snapshotRevision;
++			const stateRevision = this.#state.revision;
++			const result = await this.querySessions(sessionId, filter);
++			const currentBinding = this.binding(chatId);
++			signal.throwIfAborted();
++			if (
++				this.#selectionFlights.has(chatId) ||
++				(currentBinding !== undefined &&
++					this.#managedStarts.has(currentBinding)) ||
++				revision !== this.#snapshotRevision ||
++				stateRevision !== this.#state.revision
++			)
++				continue;
++			const binding = this.binding(chatId) ?? null;
++			const selected = binding ? this.discoverSessions(binding)[0] : undefined;
++			const bindingState = !binding
++				? "unbound"
++				: !selected
++					? "unavailable"
++					: selected.archived
++						? "archived"
++						: selected.online
++							? "ready"
++							: selected.status === "failed"
++								? "failed"
++								: "offline";
++			return { binding, bindingState, ...result };
++		}
++	}
++
++	async #awaitSelection<T>(
++		pending: Promise<T>,
++		signal: AbortSignal,
++	): Promise<T> {
++		signal.throwIfAborted();
++		return new Promise<T>((resolveWait, rejectWait) => {
++			const onAbort = () => rejectWait(abortError(signal));
++			signal.addEventListener("abort", onAbort, { once: true });
++			void pending
++				.then(resolveWait, rejectWait)
++				.finally(() => signal.removeEventListener("abort", onAbort));
++		});
++	}
++
++	async #trackSelection<T>(
++		chatId: string,
++		select: () => Promise<T>,
++	): Promise<T> {
++		const done = Promise.withResolvers<void>();
++		const flights =
++			this.#selectionFlights.get(chatId) ?? new Set<Promise<void>>();
++		flights.add(done.promise);
++		this.#selectionFlights.set(chatId, flights);
++		try {
++			return await select();
++		} finally {
++			flights.delete(done.promise);
++			if (!flights.size) this.#selectionFlights.delete(chatId);
++			done.resolve();
++		}
 +	}
 +
 +	async manageSession(
@@ -421,43 +558,52 @@ index 698860b..c64ce65 100644
  	binding(chatId: string): string | undefined {
  		return this.#state.binding(chatId);
  	}
-@@ -162,7 +495,35 @@ export class Broker {
+@@ -162,12 +626,39 @@ export class Broker {
  		sessionId: string | undefined,
  		requestId: unknown,
  		signal: AbortSignal,
 +		project: ProjectSelection = {},
  	): Promise<InitializedSession> {
-+		if (project.cwd) {
-+			const cwd = await this.#projectCwd(project.cwd);
-+			if (sessionId) {
-+				const metadata =
-+					this.#state.managedSession(sessionId) ??
-+					this.#sessions.get(sessionId)?.description;
-+				if (
-+					!metadata ||
-+					(await this.#projectCwd(metadata.cwd)) !== cwd ||
-+					(project.name && metadata.name !== project.name)
-+				)
-+					throw new BridgeError(
-+						"project_mismatch",
-+						"The requested session does not match the project",
-+						"broker",
-+						"not_started",
-+						"none",
-+						sessionId,
-+					);
-+			} else
-+				sessionId = await this.#selectProject(chatId, cwd, project, signal);
-+		} else if (project.name || project.createIfMissing)
-+			throw new BridgeError(
-+				"invalid_target",
-+				"cwd is required for project selection",
-+				"mcp",
-+			);
- 		const {
- 			sessionId: target,
- 			selection,
-@@ -186,6 +547,88 @@ export class Broker {
+-		const {
+-			sessionId: target,
+-			selection,
+-			initialization,
+-		} = await this.#selectSession(chatId, sessionId, requestId, signal, true);
++		const selected = await this.#trackSelection(chatId, async () => {
++			if (project.cwd) {
++				const cwd = await this.#projectCwd(project.cwd);
++				if (sessionId) {
++					const metadata =
++						this.#state.managedSession(sessionId) ??
++						this.#sessions.get(sessionId)?.description;
++					if (
++						!metadata ||
++						(await this.#projectCwd(metadata.cwd)) !== cwd ||
++						(project.name && metadata.name !== project.name)
++					)
++						throw new BridgeError(
++							"project_mismatch",
++							"The requested session does not match the project",
++							"broker",
++							"not_started",
++							"none",
++							sessionId,
++						);
++				} else
++					sessionId = await this.#selectProject(chatId, cwd, project, signal);
++			} else if (project.name || project.createIfMissing)
++				throw new BridgeError(
++					"invalid_target",
++					"cwd is required for project selection",
++					"mcp",
++				);
++			return this.#selectSession(chatId, sessionId, requestId, signal, true);
++		});
++		const { sessionId: target, selection, initialization } = selected;
+ 		const { inspection, inputs, globalAgents } = await this.#inspect(
+ 			target,
+ 			signal,
+@@ -186,6 +677,88 @@ export class Broker {
  		};
  	}
  
@@ -546,7 +692,7 @@ index 698860b..c64ce65 100644
  	async chat(
  		chatId: string,
  		sessionId: string | undefined,
-@@ -271,17 +714,29 @@ export class Broker {
+@@ -271,17 +844,29 @@ export class Broker {
  			name: call.name,
  			arguments: call.arguments,
  		}));
@@ -587,7 +733,7 @@ index 698860b..c64ce65 100644
  		if ("toolResults" in result) {
  			await this.#ackInputs(target, result.inputs, signal);
  			return {
-@@ -305,7 +760,7 @@ export class Broker {
+@@ -305,7 +890,7 @@ export class Broker {
  	) {
  		const target = sessionId ?? this.#state.binding(chatId);
  		if (!target) throw new Error("Specify a sessionId to read history");
@@ -596,7 +742,7 @@ index 698860b..c64ce65 100644
  		const result = await this.#request(
  			target,
  			(id) => ({
-@@ -327,7 +782,12 @@ export class Broker {
+@@ -327,7 +912,12 @@ export class Broker {
  		signal: AbortSignal,
  	): Promise<SessionInput[]> {
  		const target = sessionId ?? this.#state.binding(chatId);
@@ -610,7 +756,7 @@ index 698860b..c64ce65 100644
  		const result = await this.#request(
  			target,
  			(id) => ({ type: "inputs", id, sessionId: target }),
-@@ -501,7 +961,15 @@ export class Broker {
+@@ -501,7 +1091,15 @@ export class Broker {
  		);
  		if ("inputs" in result)
  			await this.#ackInputs(request.sessionId, result.inputs, signal);
@@ -627,7 +773,7 @@ index 698860b..c64ce65 100644
  	}
  
  	async #receive(
-@@ -509,12 +977,31 @@ export class Broker {
+@@ -509,12 +1107,31 @@ export class Broker {
  		message: SessionMessage,
  	): Promise<void> {
  		switch (message.type) {
@@ -659,7 +805,7 @@ index 698860b..c64ce65 100644
  				const controller = new AbortController();
  				relays.set(message.id, controller);
  				void this.request(message.request, controller.signal)
-@@ -551,12 +1038,37 @@ export class Broker {
+@@ -551,12 +1168,37 @@ export class Broker {
  					?.abort(new Error("Request cancelled"));
  				break;
  			case "sync": {
@@ -697,7 +843,7 @@ index 698860b..c64ce65 100644
  				await peer.send({
  					type: "synced",
  					id: message.id,
-@@ -582,7 +1094,17 @@ export class Broker {
+@@ -582,7 +1224,17 @@ export class Broker {
  				const pending = this.#pending.get(message.id);
  				if (!pending || pending.peer !== peer) break;
  				this.#finishRequest(message.id, pending);
@@ -716,11 +862,43 @@ index 698860b..c64ce65 100644
  				else {
  					const { type: _type, id: _id, ...result } = message;
  					pending.resolve(result);
-@@ -607,6 +1129,59 @@ export class Broker {
+@@ -592,7 +1244,25 @@ export class Broker {
+ 		}
+ 	}
+ 
+-	async #selectSession(
++	#selectSession(
++		chatId: string,
++		requestedId: string | undefined,
++		requestId: unknown,
++		signal: AbortSignal,
++		bindRequested = false,
++	) {
++		return this.#trackSelection(chatId, () =>
++			this.#selectSessionInternal(
++				chatId,
++				requestedId,
++				requestId,
++				signal,
++				bindRequested,
++			),
++		);
++	}
++
++	async #selectSessionInternal(
+ 		chatId: string,
+ 		requestedId: string | undefined,
+ 		requestId: unknown,
+@@ -607,6 +1277,55 @@ export class Broker {
  			signal.throwIfAborted();
  			const boundId = this.#state.binding(chatId);
  			let target = requestedId ?? boundId;
 +			let created = false;
++			if (target && this.#lifecycleOperations.has(target))
++				throw new BridgeError(
++					"session_busy",
++					"Session lifecycle management is in progress",
++				);
 +			if (target && this.#state.managedSession(target)?.archived)
 +				throw new BridgeError(
 +					"session_archived",
@@ -736,8 +914,12 @@ index 698860b..c64ce65 100644
 +				!this.#sessions.has(target)
 +			)
 +				throw new BridgeError(
-+					"session_not_found",
-+					"The session is not online or saved",
++					this.#state.externalSession(target)
++						? "external_session_offline"
++						: boundId === target && !requestedId
++							? "binding_unresolved"
++							: "session_not_found",
++					"The target is not online or recoverable; select a known session explicitly",
 +					"broker",
 +					"not_started",
 +					"none",
@@ -745,38 +927,25 @@ index 698860b..c64ce65 100644
 +				);
 +
 +			if (!target && this.#autoCreate) {
-+				target = this.#autoCreate.sessionId ?? randomUUID();
-+				const existing = this.#state.managedSession(target);
-+				if (existing?.archived)
-+					throw new BridgeError(
-+						"session_archived",
-+						"The configured project default is archived",
-+					);
-+				if (existing && (await realpath(existing.cwd)) !== this.#autoCreate.cwd)
-+					throw new BridgeError(
-+						"project_mismatch",
-+						"Configured project session belongs to another cwd",
-+					);
-+				if (!existing && this.#sessions.has(target))
-+					throw new Error(
-+						"Configured project session is not a managed Pi session",
-+					);
-+				const managed: ManagedSessionRecord = existing ?? {
-+					createdAt: new Date().toISOString(),
-+					lastUsedAt: new Date().toISOString(),
-+					cwd: this.#autoCreate.cwd,
-+					name: this.#autoCreate.sessionId
-+						? this.#autoCreate.namePrefix
-+						: `${this.#autoCreate.namePrefix}-${target.slice(0, 8)}`,
-+				};
-+				await this.#state.createManagedBinding(chatId, target, managed);
++				let creating = this.#implicitCreates.get(chatId);
++				if (!creating) {
++					creating = this.#createDefaultBinding(chatId);
++					this.#implicitCreates.set(chatId, creating);
++					void creating
++						.finally(() => {
++							if (this.#implicitCreates.get(chatId) === creating)
++								this.#implicitCreates.delete(chatId);
++						})
++						.catch(() => {});
++				}
++				target = await this.#awaitSelection(creating, signal);
 +				created = true;
 +			}
 +
  			if (!target) {
  				const occupied = this.#state.bindingCounts();
  				target = [...this.#sessions.keys()].find((id) => !occupied.has(id));
-@@ -615,10 +1190,12 @@ export class Broker {
+@@ -615,10 +1334,12 @@ export class Broker {
  				await this.#waitForChange(signal);
  				continue;
  			}
@@ -791,10 +960,51 @@ index 698860b..c64ce65 100644
  					? await this.#join(chatId, target, requestId, signal, bindRequested)
  					: undefined;
  			return {
-@@ -633,6 +1210,297 @@ export class Broker {
+@@ -633,6 +1354,351 @@ export class Broker {
  		}
  	}
  
++	async #createDefaultBinding(chatId: string): Promise<string> {
++		const options = this.#autoCreate;
++		if (!options) throw new Error("Automatic sessions are disabled");
++		const target = options.sessionId ?? randomUUID();
++		const existing = this.#state.managedSession(target);
++		if (this.#lifecycleOperations.has(target))
++			throw new BridgeError(
++				"session_busy",
++				"Session lifecycle management is in progress",
++			);
++		if (existing?.archived)
++			throw new BridgeError(
++				"session_archived",
++				"The configured project default is archived",
++			);
++		if (existing && (await realpath(existing.cwd)) !== options.cwd)
++			throw new BridgeError(
++				"project_mismatch",
++				"Configured project session belongs to another cwd",
++			);
++		if (!existing && this.#sessions.has(target))
++			throw new BridgeError(
++				"project_mismatch",
++				"Configured project session is not managed",
++			);
++		const now = new Date().toISOString();
++		await this.#state.createManagedBinding(
++			chatId,
++			target,
++			existing ?? {
++				cwd: options.cwd,
++				name: options.sessionId
++					? options.namePrefix
++					: `${options.namePrefix}-${target.slice(0, 8)}`,
++				createdAt: now,
++				lastUsedAt: now,
++			},
++		);
++		return target;
++	}
++
 +	async #ensureSessionOnline(
 +		sessionId: string,
 +		signal: AbortSignal,
@@ -861,6 +1071,18 @@ index 698860b..c64ce65 100644
 +		if (previous?.stopping) await previous.closed;
 +		this.#shutdown.signal.throwIfAborted();
 +		if (this.#sessions.has(sessionId)) return;
++		if (
++			managed.sessionFile &&
++			!(await verifySavedPiSession(managed.sessionFile, sessionId, managed.cwd))
++		)
++			throw new BridgeError(
++				"saved_session_unavailable",
++				"The recovered transcript is unavailable or changed; restore it before retrying",
++				"broker",
++				"not_started",
++				"none",
++				sessionId,
++			);
 +		const cwd = await realpath(managed.cwd).catch(() => {
 +			this.#recordDiagnostic(sessionId, "failed", "cwd_unavailable");
 +			throw new BridgeError(
@@ -883,8 +1105,9 @@ index 698860b..c64ce65 100644
 +				"chappie",
 +				"--model",
 +				"chatgpt",
-+				"--session-id",
-+				sessionId,
++				...(managed.sessionFile
++					? ["--session", managed.sessionFile]
++					: ["--session-id", sessionId]),
 +				...(managed.name ? ["--name", managed.name] : []),
 +			],
 +			{
@@ -1089,10 +1312,15 @@ index 698860b..c64ce65 100644
  	async #join(
  		chatId: string,
  		sessionId: string,
-@@ -641,6 +1509,11 @@ export class Broker {
+@@ -641,11 +1707,32 @@ export class Broker {
  		explicit = false,
  	): Promise<Initialization> {
  		signal.throwIfAborted();
++		if (this.#lifecycleOperations.has(sessionId))
++			throw new BridgeError(
++				"session_busy",
++				"Session lifecycle management is in progress",
++			);
 +		if (this.#state.managedSession(sessionId)?.archived)
 +			throw new BridgeError(
 +				"session_archived",
@@ -1101,7 +1329,24 @@ index 698860b..c64ce65 100644
  		const previous = this.#state.binding(chatId);
  		const key = JSON.stringify([chatId, sessionId]);
  		const observer = (this.#cooldowns.get(key) ?? 0) > Date.now();
-@@ -696,13 +1569,23 @@ export class Broker {
+ 		if (!observer) this.#cooldown(chatId, sessionId);
+-		await this.#state.bind(chatId, sessionId);
++		const description = this.#sessions.get(sessionId)?.description;
++		await this.#state.bind(
++			chatId,
++			sessionId,
++			description
++				? {
++						agent: description.agent,
++						cwd: description.cwd,
++						...(description.name ? { name: description.name } : {}),
++					}
++				: undefined,
++		);
+ 		signal.throwIfAborted();
+ 		const activity = source(chatId, requestId);
+ 		if (previous !== sessionId) {
+@@ -696,13 +1783,23 @@ export class Broker {
  	async #inspect(
  		sessionId: string,
  		signal: AbortSignal,
@@ -1126,10 +1371,15 @@ index 698860b..c64ce65 100644
  		throw new Error("Session returned no inspection");
  	}
  
-@@ -727,6 +1610,15 @@ export class Broker {
+@@ -727,6 +1824,20 @@ export class Broker {
  		message: (id: number) => BrokerMessage,
  		signal: AbortSignal,
  	): Promise<SessionResult> {
++		if (this.#lifecycleOperations.has(sessionId))
++			throw new BridgeError(
++				"session_busy",
++				"Session lifecycle management is in progress",
++			);
 +		if (this.#state.managedSession(sessionId)?.archived)
 +			throw new BridgeError(
 +				"session_archived",
@@ -1142,7 +1392,7 @@ index 698860b..c64ce65 100644
  		if (signal.aborted) throw abortError(signal);
  		const id = this.#nextRequestId++;
  		const request = message(id);
-@@ -735,8 +1627,22 @@ export class Broker {
+@@ -735,8 +1846,22 @@ export class Broker {
  				? this.#resources.get(request.uri)
  				: this.#sessions.get(sessionId)?.peer;
  		if (!peer)
@@ -1167,7 +1417,7 @@ index 698860b..c64ce65 100644
  			);
  		const completion = Promise.withResolvers<SessionResult>();
  		const onAbort = (): void => {
-@@ -755,6 +1661,7 @@ export class Broker {
+@@ -755,6 +1880,7 @@ export class Broker {
  		};
  		const pending: PendingRequest = {
  			peer,
@@ -1175,7 +1425,7 @@ index 698860b..c64ce65 100644
  			resolve: completion.resolve,
  			reject: completion.reject,
  			signal,
-@@ -766,7 +1673,9 @@ export class Broker {
+@@ -766,7 +1892,9 @@ export class Broker {
  			this.#finishRequest(id, pending);
  			pending.reject(error instanceof Error ? error : new Error(String(error)));
  		});
@@ -1186,7 +1436,15 @@ index 698860b..c64ce65 100644
  	}
  
  	#waitForChange(signal: AbortSignal): Promise<void> {
-@@ -814,11 +1723,25 @@ export class Broker {
+@@ -788,6 +1916,7 @@ export class Broker {
+ 	}
+ 
+ 	#notifyChange(): void {
++		this.#snapshotRevision++;
+ 		for (const waiter of this.#waiters) {
+ 			this.#waiters.delete(waiter);
+ 			waiter.signal.removeEventListener("abort", waiter.onAbort);
+@@ -814,11 +1943,25 @@ export class Broker {
  		for (const [id, pending] of this.#pending) {
  			if (pending.peer !== peer) continue;
  			this.#finishRequest(id, pending);
@@ -1213,7 +1471,7 @@ index 698860b..c64ce65 100644
  		this.#sessions.delete(sessionId);
  		this.#notifyChange();
  	}
-@@ -831,3 +1754,10 @@ function abortError(signal: AbortSignal): Error {
+@@ -831,3 +1974,10 @@ function abortError(signal: AbortSignal): Error {
  				typeof signal.reason === "string" ? signal.reason : "Request cancelled",
  			);
  }
@@ -1867,8 +2125,152 @@ index 0000000..c662b37
 +		this.#tail = text.slice(-128);
 +	}
 +}
+diff --git a/src/saved-sessions.ts b/src/saved-sessions.ts
+new file mode 100644
+index 0000000..3aad706
+--- /dev/null
++++ b/src/saved-sessions.ts
+@@ -0,0 +1,138 @@
++import { constants, type Dirent } from "node:fs";
++import { open, readdir } from "node:fs/promises";
++import { isAbsolute, join } from "node:path";
++import type { ManagedSessionRecord } from "./state.ts";
++
++export type SavedSession =
++	| { status: "found"; metadata: ManagedSessionRecord }
++	| { status: "missing" | "unavailable" };
++
++export const piSessionId = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
++
++// Inspect only session headers, never transcript messages or authentication files.
++// An incomplete scan must not turn an unreadable session into a deleted binding.
++export async function findSavedPiSessions(
++	agentDirectory: string,
++	targets: Set<string>,
++): Promise<Map<string, SavedSession>> {
++	const matches = new Map<string, ManagedSessionRecord[]>();
++	let complete = true;
++	let files = 0;
++	async function scan(directory: string, depth: number): Promise<void> {
++		let entries: Dirent[];
++		try {
++			entries = await readdir(directory, { withFileTypes: true });
++		} catch (error) {
++			if ((error as NodeJS.ErrnoException).code !== "ENOENT") complete = false;
++			return;
++		}
++		for (const entry of entries) {
++			const path = join(directory, entry.name);
++			if (entry.isDirectory()) {
++				if (depth < 4) await scan(path, depth + 1);
++				else complete = false;
++				continue;
++			}
++			if (entry.isSymbolicLink()) {
++				complete = false;
++				continue;
++			}
++			if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
++			if (++files > 10_000) {
++				complete = false;
++				return;
++			}
++			try {
++				const metadata = await readSavedSession(path, targets);
++				if (metadata) {
++					const found = matches.get(metadata.id) ?? [];
++					found.push(metadata.record);
++					matches.set(metadata.id, found);
++				}
++			} catch {
++				complete = false;
++			}
++		}
++	}
++	if (targets.size) await scan(join(agentDirectory, "sessions"), 0);
++	return new Map(
++		[...targets].map((id) => {
++			const found = matches.get(id) ?? [];
++			return [
++				id,
++				complete && found.length === 1 && found[0]
++					? { status: "found" as const, metadata: found[0] }
++					: {
++							status:
++								found.length === 0 && complete
++									? ("missing" as const)
++									: ("unavailable" as const),
++						},
++			];
++		}),
++	);
++}
++
++async function readSavedSession(path: string, targets: Set<string>) {
++	const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
++	try {
++		const chunks: Buffer[] = [];
++		let offset = 0;
++		let finished = false;
++		while (offset < 65_536) {
++			const buffer = Buffer.alloc(4096);
++			const { bytesRead } = await file.read(buffer, 0, buffer.length, offset);
++			const bytes = buffer.subarray(0, bytesRead);
++			const end = bytes.indexOf(10);
++			chunks.push(end < 0 ? bytes : bytes.subarray(0, end));
++			if (end >= 0 || bytesRead === 0) {
++				finished = true;
++				break;
++			}
++			offset += bytesRead;
++		}
++		if (!finished) throw new Error("Session header exceeds discovery limit");
++		const header = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
++			type?: unknown;
++			id?: unknown;
++			cwd?: unknown;
++			version?: unknown;
++			timestamp?: unknown;
++		};
++		if (header.type !== "session" || typeof header.id !== "string")
++			throw new Error("Invalid session header");
++		if (!targets.has(header.id)) return undefined;
++		if (
++			typeof header.cwd !== "string" ||
++			!isAbsolute(header.cwd) ||
++			![1, 2, 3].includes(Number(header.version ?? 1))
++		)
++			throw new Error("Unsupported saved session metadata");
++		return {
++			id: header.id,
++			record: {
++				cwd: header.cwd,
++				sessionFile: path,
++				...(typeof header.timestamp === "string" &&
++				Number.isFinite(Date.parse(header.timestamp))
++					? { createdAt: header.timestamp }
++					: {}),
++			} satisfies ManagedSessionRecord,
++		};
++	} finally {
++		await file.close();
++	}
++}
++
++export async function verifySavedPiSession(
++	path: string,
++	id: string,
++	cwd: string,
++): Promise<boolean> {
++	try {
++		const saved = await readSavedSession(path, new Set([id]));
++		return saved?.record.cwd === cwd;
++	} catch {
++		return false;
++	}
++}
 diff --git a/src/server.ts b/src/server.ts
-index 7c68f2c..dfa2a59 100644
+index 7c68f2c..9753654 100644
 --- a/src/server.ts
 +++ b/src/server.ts
 @@ -4,6 +4,7 @@ import * as z from "zod";
@@ -2015,7 +2417,7 @@ index 7c68f2c..dfa2a59 100644
  	server.registerTool(
  		"call",
  		{
-@@ -421,27 +503,46 @@ export function createServer(broker: Broker): McpServer {
+@@ -421,27 +503,51 @@ export function createServer(broker: Broker): McpServer {
  		{
  			title: "Sessions",
  			description:
@@ -2057,6 +2459,7 @@ index 7c68f2c..dfa2a59 100644
 -				args.sessionId,
 -				context.mcpReq.signal,
 -			);
++			await broker.waitForSelection(chatId, context.mcpReq.signal);
 +			const target = args.sessionId ?? broker.binding(chatId);
 +			const inputs =
 +				target && broker.listSessions(target).length
@@ -2064,13 +2467,18 @@ index 7c68f2c..dfa2a59 100644
 +					: [];
  			const result = textResult(
  				{
- 					binding: broker.binding(chatId) ?? null,
+-					binding: broker.binding(chatId) ?? null,
 -					sessions: broker.listSessions(args.sessionId),
-+					...(await broker.querySessions(args.sessionId, args)),
++					...(await broker.sessionSnapshot(
++						chatId,
++						args.sessionId,
++						args,
++						context.mcpReq.signal,
++					)),
  				},
  				inputs,
  			);
-@@ -449,6 +550,40 @@ export function createServer(broker: Broker): McpServer {
+@@ -449,6 +555,40 @@ export function createServer(broker: Broker): McpServer {
  		}),
  	);
  
@@ -2111,7 +2519,7 @@ index 7c68f2c..dfa2a59 100644
  	server.registerResource(
  		"Session resource",
  		new ResourceTemplate(
-@@ -503,12 +638,29 @@ async function finishResult<
+@@ -503,12 +643,29 @@ async function finishResult<
  		...answerContent(answers),
  	];
  	await broker.acknowledge(deliveries, answers, context.mcpReq.signal);
@@ -2142,7 +2550,7 @@ index 7c68f2c..dfa2a59 100644
  	const content = result.content.map((block) => {
  		if (block.type !== "resource_link") return block;
  		const uri = new URL(block.uri);
-@@ -516,9 +668,23 @@ function formatResult<
+@@ -516,9 +673,23 @@ function formatResult<
  		return { ...block, uri: uri.href };
  	});
  	return {
@@ -2167,7 +2575,7 @@ index 7c68f2c..dfa2a59 100644
  			text: content
  				.flatMap((block) => (block.type === "text" ? [block.text] : []))
  				.join("\n"),
-@@ -529,6 +695,10 @@ function formatResult<
+@@ -529,6 +700,10 @@ function formatResult<
  function requireChatId(context: Pick<RequestContext, "mcpReq">): string {
  	const chatId = context.mcpReq._meta?.["openai/session"];
  	if (typeof chatId !== "string" || !chatId)
@@ -2357,11 +2765,16 @@ index e1c0d54..b807206 100644
  
  	#rejectSyncs(error: Error): void {
 diff --git a/src/state.ts b/src/state.ts
-index 117c658..22b59d9 100644
+index 117c658..f73da50 100644
 --- a/src/state.ts
 +++ b/src/state.ts
-@@ -3,8 +3,17 @@ import { join } from "node:path";
+@@ -1,10 +1,34 @@
+-import { readFile, rename, writeFile } from "node:fs/promises";
+-import { join } from "node:path";
++import { open, readFile, rename } from "node:fs/promises";
++import { isAbsolute, join } from "node:path";
  import type { DeliveryRecord } from "./delivery.ts";
++import { BridgeError } from "./errors.ts";
  import type { QuestionAnswer, QuestionRecord } from "./questions.ts";
  
 +export interface ManagedSessionRecord {
@@ -2370,23 +2783,44 @@ index 117c658..22b59d9 100644
 +	createdAt?: string;
 +	lastUsedAt?: string;
 +	archived?: boolean;
++	sessionFile?: string;
++}
++
++export interface ExternalSessionRecord {
++	agent: string;
++	cwd: string;
++	name?: string;
++}
++
++interface SessionState {
++	bindings: Map<string, string>;
++	managed: Map<string, ManagedSessionRecord>;
++	external: Map<string, ExternalSessionRecord>;
 +}
 +
  interface StateFile {
  	bindings?: Record<string, string>;
 +	managedSessions?: Record<string, ManagedSessionRecord>;
++	externalSessions?: Record<string, ExternalSessionRecord>;
  	deliveries?: DeliveryRecord[];
  	questions?: QuestionRecord[];
  }
-@@ -13,6 +22,7 @@ export class State {
+@@ -12,10 +36,13 @@ interface StateFile {
+ export class State {
  	readonly #path: string;
  	readonly #temporaryPath: string;
- 	readonly #bindings = new Map<string, string>();
-+	readonly #managedSessions = new Map<string, ManagedSessionRecord>();
+-	readonly #bindings = new Map<string, string>();
++	#bindings = new Map<string, string>();
++	#managedSessions = new Map<string, ManagedSessionRecord>();
++	#externalSessions = new Map<string, ExternalSessionRecord>();
  	readonly #deliveries = new Map<string, DeliveryRecord>();
  	readonly #questions = new Map<string, QuestionRecord>();
  	#writes = Promise.resolve();
-@@ -34,6 +44,32 @@ export class State {
++	#revision = 0;
+ 
+ 	constructor(directory: string) {
+ 		this.#path = join(directory, "state.json");
+@@ -34,6 +61,49 @@ export class State {
  		for (const [chatId, sessionId] of Object.entries(state.bindings ?? {})) {
  			if (typeof sessionId === "string") this.#bindings.set(chatId, sessionId);
  		}
@@ -2413,16 +2847,64 @@ index 117c658..22b59d9 100644
 +					...(typeof managed.archived === "boolean"
 +						? { archived: managed.archived }
 +						: {}),
++					...(typeof managed.sessionFile === "string" &&
++					isAbsolute(managed.sessionFile)
++						? { sessionFile: managed.sessionFile }
++						: {}),
 +				});
 +			}
++		}
++		for (const [id, external] of Object.entries(state.externalSessions ?? {})) {
++			if (
++				external &&
++				typeof external.agent === "string" &&
++				typeof external.cwd === "string" &&
++				!this.#managedSessions.has(id)
++			)
++				this.#externalSessions.set(id, {
++					agent: external.agent,
++					cwd: external.cwd,
++					...(typeof external.name === "string" ? { name: external.name } : {}),
++				});
 +		}
  		for (const delivery of state.deliveries ?? []) {
  			if (delivery?.id) this.#deliveries.set(delivery.id, delivery);
  		}
-@@ -58,6 +94,43 @@ export class State {
- 		return this.#save();
+@@ -45,6 +115,10 @@ export class State {
+ 		return this.#bindings.get(chatId);
  	}
  
++	get revision(): number {
++		return this.#revision;
++	}
++
+ 	bindingCounts(): Map<string, number> {
+ 		const counts = new Map<string, number>();
+ 		for (const sessionId of this.#bindings.values()) {
+@@ -53,9 +127,106 @@ export class State {
+ 		return counts;
+ 	}
+ 
+-	bind(chatId: string, sessionId: string): Promise<void> {
+-		this.#bindings.set(chatId, sessionId);
+-		return this.#save();
++	bind(
++		chatId: string,
++		sessionId: string,
++		external?: ExternalSessionRecord,
++	): Promise<void> {
++		return this.#save((state) => {
++			if (state.managed.get(sessionId)?.archived)
++				throw new BridgeError(
++					"session_archived",
++					"Restore the archived session before binding it",
++				);
++			state.bindings.set(chatId, sessionId);
++			if (external && !state.managed.has(sessionId))
++				state.external.set(sessionId, external);
++		});
++	}
++
 +	managedSession(sessionId: string): ManagedSessionRecord | undefined {
 +		return this.#managedSessions.get(sessionId);
 +	}
@@ -2431,19 +2913,60 @@ index 117c658..22b59d9 100644
 +		return [...this.#managedSessions];
 +	}
 +
++	externalSession(sessionId: string): ExternalSessionRecord | undefined {
++		return this.#externalSessions.get(sessionId);
++	}
++
++	externalSessions(): [string, ExternalSessionRecord][] {
++		return [...this.#externalSessions];
++	}
++
++	unresolvedTargets(): string[] {
++		return [...new Set(this.#bindings.values())].filter(
++			(id) => !this.#managedSessions.has(id) && !this.#externalSessions.has(id),
++		);
++	}
++
++	reconcile(
++		recovered: Map<string, ManagedSessionRecord>,
++		missing: Set<string>,
++	): Promise<void> {
++		return this.#save((state) => {
++			for (const [id, metadata] of recovered) {
++				if (!state.managed.has(id) && !state.external.has(id))
++					state.managed.set(id, metadata);
++			}
++			for (const [chatId, id] of state.bindings) {
++				if (
++					missing.has(id) &&
++					!state.managed.has(id) &&
++					!state.external.has(id)
++				)
++					state.bindings.delete(chatId);
++			}
++		});
++	}
++
 +	unbind(chatId: string): Promise<void> {
-+		this.#bindings.delete(chatId);
-+		return this.#save();
++		return this.#save((state) => {
++			state.bindings.delete(chatId);
++		});
 +	}
 +
 +	updateManaged(
 +		sessionId: string,
 +		patch: Partial<ManagedSessionRecord>,
 +	): Promise<void> {
-+		const current = this.#managedSessions.get(sessionId);
-+		if (!current) throw new Error("Managed session not found");
-+		this.#managedSessions.set(sessionId, { ...current, ...patch });
-+		return this.#save();
++		return this.#save((state) => {
++			const current = state.managed.get(sessionId);
++			if (!current) throw new Error("Managed session not found");
++			if (patch.archived && [...state.bindings.values()].includes(sessionId))
++				throw new BridgeError(
++					"session_bound",
++					"Unbind conversations before archiving this session",
++				);
++			state.managed.set(sessionId, { ...current, ...patch });
++		});
 +	}
 +
 +	flush(): Promise<void> {
@@ -2455,35 +2978,67 @@ index 117c658..22b59d9 100644
 +		sessionId: string,
 +		managed: ManagedSessionRecord,
 +	): Promise<void> {
-+		this.#managedSessions.set(sessionId, managed);
-+		this.#bindings.set(chatId, sessionId);
-+		await this.#save();
-+	}
-+
++		await this.#save((state) => {
++			if (state.managed.get(sessionId)?.archived)
++				throw new BridgeError(
++					"session_archived",
++					"Restore the archived session before binding it",
++				);
++			if (!state.managed.has(sessionId)) state.managed.set(sessionId, managed);
++			state.external.delete(sessionId);
++			state.bindings.set(chatId, sessionId);
++		});
+ 	}
+ 
  	deliveries(chatId: string): DeliveryRecord[] {
- 		return [...this.#deliveries.values()].filter(
- 			(delivery) => delivery.clientId === chatId,
-@@ -148,9 +221,19 @@ export class State {
- 	#save(): Promise<void> {
+@@ -145,17 +316,38 @@ export class State {
+ 		}
+ 	}
+ 
+-	#save(): Promise<void> {
++	#save(mutate?: (state: SessionState) => void): Promise<void> {
  		const saved = this.#writes.then(async () => {
- 			const bindings = Object.fromEntries(this.#bindings);
-+			const managedSessions = Object.fromEntries(this.#managedSessions);
- 			await writeFile(
- 				this.#temporaryPath,
+-			const bindings = Object.fromEntries(this.#bindings);
+-			await writeFile(
+-				this.#temporaryPath,
 -				`${JSON.stringify({ bindings, deliveries: [...this.#deliveries.values()], questions: [...this.#questions.values()] }, null, 2)}\n`,
-+				`${JSON.stringify(
-+					{
-+						bindings,
-+						managedSessions,
-+						deliveries: [...this.#deliveries.values()],
-+						questions: [...this.#questions.values()],
-+					},
-+					null,
-+					2,
-+				)}\n`,
- 				{
- 					mode: 0o600,
- 				},
+-				{
+-					mode: 0o600,
+-				},
+-			);
++			const next: SessionState = {
++				bindings: new Map(this.#bindings),
++				managed: new Map(this.#managedSessions),
++				external: new Map(this.#externalSessions),
++			};
++			mutate?.(next);
++			const file = await open(this.#temporaryPath, "w", 0o600);
++			try {
++				await file.writeFile(
++					`${JSON.stringify(
++						{
++							bindings: Object.fromEntries(next.bindings),
++							managedSessions: Object.fromEntries(next.managed),
++							externalSessions: Object.fromEntries(next.external),
++							deliveries: [...this.#deliveries.values()],
++							questions: [...this.#questions.values()],
++						},
++						null,
++						2,
++					)}\n`,
++				);
++				await file.sync();
++			} finally {
++				await file.close();
++			}
+ 			await rename(this.#temporaryPath, this.#path);
++			this.#bindings = next.bindings;
++			this.#managedSessions = next.managed;
++			this.#externalSessions = next.external;
++			this.#revision++;
+ 		});
+ 		this.#writes = saved.catch(() => {});
+ 		return saved;
 diff --git a/src/tools.ts b/src/tools.ts
 index 312f373..abdee11 100644
 --- a/src/tools.ts

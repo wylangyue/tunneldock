@@ -16,6 +16,7 @@ const runFile = promisify(execFile);
 const source = process.env.CHAPPIE_SOURCE_DIR;
 assert.ok(source, "set CHAPPIE_SOURCE_DIR to a patched Chappie 1.1.0 checkout");
 const { Broker } = await import(pathToFileURL(join(resolve(source), "src/broker.ts")));
+const { State } = await import(pathToFileURL(join(resolve(source), "src/state.ts")));
 const { extensionBuild, runtimeCapabilities } = await import(pathToFileURL(join(resolve(source), "src/runtime.ts")));
 const { queryDiagnostics } = await import(pathToFileURL(join(resolve(source), "src/diagnostics.ts")));
 const { createServer } = await import(pathToFileURL(join(resolve(source), "src/server.ts")));
@@ -49,9 +50,10 @@ async function fixture(t, { real = false, idleMinutes = 0, sessionId } = {}) {
     await mkdir(bin);
     await writeFile(join(bin, "pi"), `#!${process.execPath}
 import { createConnection } from "node:net";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
-const sid = process.argv[process.argv.indexOf("--session-id") + 1];
+const savedFile = process.argv.includes("--session") ? process.argv[process.argv.indexOf("--session") + 1] : undefined;
+const sid = savedFile ? JSON.parse(readFileSync(savedFile, "utf8").split("\\n")[0]).id : process.argv[process.argv.indexOf("--session-id") + 1];
 appendFileSync(process.env.HOME + "/starts", sid + "\\n");
 if (process.env.TEST_FAIL_START === "1") {
  process.stderr.write("Error loading extension: MODULE_NOT_FOUND synthetic-secret-not-for-output\\n");
@@ -142,6 +144,122 @@ async function mcpFixture(t, broker) {
     call: (name, args = {}, chatId = "mcp-a") => request("tools/call", { name, arguments: args, _meta: { "openai/session": chatId, "otunnel/requestId": nextId } }),
   };
 }
+
+test("session transactions publish together after persistence and retain the previous state on write failure", async t => {
+  const root = await mkdtemp(join(tmpdir(), "td-state-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const state = new State(root);
+  const sid = "12345678-1234-4234-8234-123456789abc";
+  await mkdir(join(root, "state.json"));
+  const failed = state.createManagedBinding("chat", sid, { cwd: root });
+  assert.equal(state.binding("chat"), undefined);
+  assert.equal(state.managedSession(sid), undefined);
+  await assert.rejects(failed);
+  assert.equal(state.binding("chat"), undefined);
+  assert.equal(state.managedSession(sid), undefined);
+  await rm(join(root, "state.json"), { recursive: true });
+  await Promise.all([
+    state.createManagedBinding("a", sid, { cwd: root }),
+    state.createManagedBinding("b", sid, { cwd: root }),
+  ]);
+  const disk = JSON.parse(await readFile(join(root, "state.json"), "utf8"));
+  assert.equal(disk.bindings.a, sid); assert.equal(disk.bindings.b, sid);
+  assert.ok(disk.managedSessions[sid]);
+  assert.equal((await stat(join(root, "state.json"))).mode & 0o777, 0o600);
+  await assert.rejects(state.updateManaged(sid, { archived: true }), error => error.code === "session_bound");
+  const external = "22345678-1234-4234-8234-123456789abc";
+  await state.bind("external", external, { agent: "codex", cwd: root });
+  const reloaded = new State(root); await reloaded.load();
+  assert.equal(reloaded.externalSession(external).agent, "codex");
+});
+
+test("sessions waits for concurrent selection and inspection while unrelated discovery stays passive", async t => {
+  const f = await fixture(t);
+  process.env.TEST_START_DELAY = "100";
+  process.env.TEST_INSPECT_DELAY = "200";
+  const broker = await f.start();
+  const mcp = await mcpFixture(t, broker);
+  const untouched = JSON.parse((await mcp.call("sessions")).content[0].text);
+  assert.equal(untouched.binding, null); assert.equal(untouched.bindingState, "unbound");
+  await assert.rejects(stat(join(f.root, "starts")), { code: "ENOENT" });
+  const tools = mcp.call("tools");
+  await until(() => broker.binding("mcp-a"));
+  let settled = false;
+  const queried = mcp.call("sessions").then(result => { settled = true; return JSON.parse(result.content[0].text); });
+  const unrelated = JSON.parse((await mcp.call("sessions", {}, "other-chat")).content[0].text);
+  assert.equal(unrelated.binding, null);
+  await delay(50); assert.equal(settled, false);
+  const [catalog, snapshot] = await Promise.all([tools, queried]);
+  const sid = JSON.parse(catalog.content[0].text).session.id;
+  assert.equal(snapshot.binding, sid); assert.equal(snapshot.bindingState, "ready");
+  assert.equal(snapshot.sessions.find(session => session.id === sid).online, true);
+  assert.equal(snapshot.sessions.find(session => session.id === sid).bindingCount, 1);
+  const overlapping = broker.sessionSnapshot("overlap", undefined, { cwd: f.root }, signal());
+  const initialized = broker.initialize("overlap", undefined, 1, signal());
+  const [nextSnapshot, nextSession] = await Promise.all([overlapping, initialized]);
+  assert.equal(nextSnapshot.binding, nextSession.session.id);
+  assert.equal(nextSnapshot.bindingState, "ready");
+  assert.equal((await f.starts()).length, 2);
+});
+
+test("cancelling a snapshot wait does not cancel shared initialization", async t => {
+  const f = await fixture(t);
+  process.env.TEST_START_DELAY = "250";
+  const broker = await f.start();
+  const initializing = broker.initialize("a", undefined, 1, signal());
+  await until(() => broker.binding("a"));
+  await assert.rejects(broker.sessionSnapshot("a", undefined, {}, AbortSignal.timeout(25)));
+  const selected = await initializing;
+  assert.equal((await broker.sessionSnapshot("a", undefined, {}, signal())).binding, selected.session.id);
+});
+
+test("startup restores legacy Pi references, drops confirmed missing targets and preserves external bindings and orphans", async t => {
+  const f = await fixture(t);
+  const recovered = "12345678-1234-4234-8234-123456789abc";
+  const missing = "22345678-1234-4234-8234-123456789abc";
+  const external = "32345678-1234-4234-8234-123456789abc";
+  const orphan = "42345678-1234-4234-8234-123456789abc";
+  const sessions = join(f.root, ".pi/agent/sessions/project"); await mkdir(sessions, { recursive: true });
+  const transcript = join(sessions, `legacy_${recovered}.jsonl`);
+  await writeFile(transcript, JSON.stringify({ type: "session", version: 3, id: recovered, cwd: f.root, timestamp: "2026-01-01T00:00:00Z" }) + "\n");
+  await writeFile(join(f.directory, "state.json"), JSON.stringify({
+    bindings: { old: recovered, shared: recovered, stale: missing, external },
+    managedSessions: { [orphan]: { cwd: f.root } },
+    externalSessions: { [external]: { agent: "codex", cwd: f.root, name: "manual" } },
+  }));
+  const broker = await f.start();
+  assert.equal(broker.binding("old"), recovered); assert.equal(broker.binding("stale"), undefined);
+  assert.equal(broker.binding("external"), external);
+  const snapshot = await broker.sessionSnapshot("old", undefined, {}, signal());
+  assert.equal(snapshot.bindingState, "offline");
+  assert.ok(snapshot.sessions.some(session => session.id === orphan));
+  assert.ok(snapshot.sessions.some(session => session.id === external && !session.managed));
+  await assert.rejects(stat(join(f.root, "starts")), { code: "ENOENT" });
+  const disk = JSON.parse(await readFile(join(f.directory, "state.json"), "utf8"));
+  assert.equal(disk.managedSessions[recovered].sessionFile, transcript);
+  assert.equal((await broker.initialize("old", undefined, 1, signal())).session.id, recovered);
+  await broker.close(); await rm(transcript);
+  const restarted = await f.start();
+  await assert.rejects(restarted.initialize("old", undefined, 2, signal()), error => error.code === "saved_session_unavailable");
+  assert.equal(restarted.binding("old"), recovered);
+  assert.equal((await f.starts()).length, 1, "a missing recovered transcript must not create an empty replacement");
+});
+
+test("an incomplete or ambiguous transcript scan preserves unresolved bindings", async t => {
+  const f = await fixture(t);
+  const id = "12345678-1234-4234-8234-123456789abc";
+  const missing = "22345678-1234-4234-8234-123456789abc";
+  const directory = join(f.root, ".pi/agent/sessions/project"); await mkdir(directory, { recursive: true });
+  const header = JSON.stringify({ type: "session", version: 3, id, cwd: f.root }) + "\n";
+  await writeFile(join(directory, "one.jsonl"), header);
+  await writeFile(join(directory, "two.jsonl"), header);
+  await writeFile(join(directory, "broken.jsonl"), "not a session header\n");
+  await writeFile(join(f.directory, "state.json"), JSON.stringify({ bindings: { ambiguous: id, unresolved: missing } }));
+  const broker = await f.start();
+  assert.equal(broker.binding("ambiguous"), id); assert.equal(broker.binding("unresolved"), missing);
+  assert.equal((await broker.sessionSnapshot("unresolved", undefined, {}, signal())).bindingState, "unavailable");
+  await assert.rejects(broker.initialize("unresolved", undefined, 1, signal()), error => error.code === "binding_unresolved");
+});
 
 test("project default shares one managed Pi and survives restart without replacing old bindings", async t => {
   const sid = "12345678-1234-4234-8234-123456789abc";
@@ -503,10 +621,14 @@ test("packaged stdio MCP reaches real Pi and exposes offline recovery", {
   t.after(() => client.close());
   assert.ok(client.tools.has("bash"));
   const call = (name, args = {}) => client.call(name, args, "stdio-chat");
-  const bash = await client.native("bash", { command: "printf stdio-to-pi-ok" }, "stdio-chat");
+  const operation = client.native("bash", { command: "printf stdio-to-pi-ok" }, "stdio-chat");
+  const concurrentSnapshot = call("sessions");
+  const [bash, snapshotResult] = await Promise.all([operation, concurrentSnapshot]);
   assert.equal(bash.isError, false);
   assert.match(bash.structuredContent.text, /stdio-to-pi-ok/);
   const sid = JSON.parse(bash.content[0].text).sessionId;
+  const liveSnapshot = JSON.parse(snapshotResult.content[0].text);
+  assert.equal(liveSnapshot.binding, sid); assert.equal(liveSnapshot.bindingState, "ready");
   await delay(1000);
   const saved = JSON.parse((await call("sessions")).content[0].text);
   assert.equal(saved.sessions.find(item => item.id === sid).online, false);
@@ -568,7 +690,13 @@ test("real Pi MCP tools, explicit routing, transcript and idle/restart recovery"
   assert.equal(afterIdle.sessionId, a.session.id);
   assert.ok(JSON.stringify(afterIdle).includes(message));
   await broker.close();
+  const statePath = join(f.directory, "state.json");
+  const legacyState = JSON.parse(await readFile(statePath, "utf8"));
+  delete legacyState.managedSessions[a.session.id];
+  await writeFile(statePath, JSON.stringify(legacyState));
   broker = await f.start();
+  const recoveredState = JSON.parse(await readFile(statePath, "utf8"));
+  assert.ok(recoveredState.managedSessions[a.session.id].sessionFile);
   const restored = await broker.initialize("real-a", undefined, 5, signal());
   assert.equal(restored.session.id, a.session.id);
   const after = await broker.history("real-a", undefined, { limit: 50 }, 6, signal());

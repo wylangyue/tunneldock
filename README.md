@@ -8,10 +8,10 @@
 
 | 组件 | 默认版本 | 说明 |
 | --- | --- | --- |
-| TunnelDock | 0.4.0 | 增加 cwd 项目选择、结构化错误、会话生命周期和外部 E2E 入口 |
+| TunnelDock | 0.4.1 | 增加初始化快照同步、旧绑定恢复和提交后的状态可见性 |
 | Node.js | 26.10.0 | 已有 Node >= 26 时保留现有版本 |
 | Pi coding agent | 0.99.2 | 已验证实际会话创建、历史恢复及空闲恢复 |
-| Chappie | 1.1.0-tunneldock.5 | 基于官方 1.1.0，支持 MCP 直接工具、cwd 项目选择和会话管理 |
+| Chappie | 1.1.0-tunneldock.6 | 基于官方 1.1.0，支持直接工具、项目会话和绑定一致性恢复 |
 | otunnel | 0.2.0 | 使用官方 Linux GNU release，运行失败时本机编译 |
 | pnpm | 12.4.1 | 仅在临时目录用于构建 Chappie |
 
@@ -65,7 +65,7 @@ configure-chappie-tunnel \
 1. 检查 Linux、systemd user bus 和版本参数，再准备基础工具、Python/PyYAML、Node、Pi。
 2. 下载 otunnel 预编译包并实际执行版本检查。下载、解压或运行失败时，使用 Rust stable、本机编译器和 CMake 从锁定 tag 编译。
 3. 拉取 Chappie v1.1.0，严格验证并应用补丁，按上游 frozen lockfile 安装构建依赖，执行 TypeScript 检查及 bundle 构建。
-4. 将构建产物以 `1.1.0-tunneldock.5` 安装为全局 broker；Pi 注册同一安装目录的扩展。
+4. 将构建产物以 `1.1.0-tunneldock.6` 安装为全局 broker；Pi 注册同一安装目录的扩展。
 5. 迁移旧配置、broker 状态和 MCP 启动命令，保留原始旧文件及会话 transcript。
 6. 安装 systemd unit 和命令入口，尝试启用 linger。
 
@@ -120,6 +120,12 @@ MCP `sessions` 同时列出在线会话和保存的离线托管会话，包含 `
 上述参数传给 MCP `init`：cwd 必须是存在的绝对目录，符号链接按 realpath 归一化。先查找同目录、同名称的未归档托管会话；无匹配时仅在 `createIfMissing: true` 下创建，并发同项目创建共享同一个 ID。未指定名称时优先复用当前对话在该目录的绑定；否则多匹配返回 `ambiguous_project`，不猜测目标。显式 `sessionId` 配合 cwd/name 时必须匹配。项目查找失败不会回退到全局 cwd。项目名称是选择条件，不会把其他目录的同名会话合并。
 
 MCP `sessions` 支持 `cwd`、精确 `name`、`status`、`online`、`managed`、`includeArchived` 过滤，以及 `limit`（1..200，默认 50）和 `offset` 分页；返回 `total` 与 `nextOffset`。托管元数据记录 `createdAt`、`lastUsedAt` 和 `archived`，旧状态文件仍可读取，历史时间未知时不补造时间。
+
+`sessions` 返回 `bindingState`（`unbound`、`ready`、`offline`、`failed`、`archived` 或 `unavailable`）。同一对话正在初始化、join 或校验 managed handshake 时，查询等待这些步骤完成后取一致快照；查询等待可取消，共享启动继续运行。其他对话的查询不等待该初始化。没有初始化请求时首次查询可正常返回 `unbound`，且不会创建会话；MCP 的静态直接工具目录与当前对话是否已绑定是两个独立状态。
+
+启用本地 Pi `autoCreate` 时，启动会检查缺少 managed/external metadata 的旧 UUID 绑定。在 Pi agent 的 `sessions` 目录中仅检查 session header：存在唯一有效 transcript 时重建 managed metadata；完整扫描确认目标不存在时移除该旧绑定；读取失败、超出扫描限制或存在重复 ID 时保留绑定，访问返回结构化错误。恢复记录保存原 transcript 路径，后续使用 `--session` 打开原文件并校验 ID/cwd；文件丢失或改变时不会用同一 ID 新建空会话。未绑定 managed session 保留。新建的非托管会话绑定保存 agent/cwd/name 到 `externalSessions`，不因缺少 managed metadata 被清理；离线外部目标要求原外部进程上线，不由 broker 接管。
+
+会话状态变更在同一写入队列中构建下一份 bindings/managed/external 状态，写入临时文件并 fsync 后原子 rename；持久化成功后才同时发布内存状态，失败保留原绑定和 metadata。并发首次访问同一对话共享创建结果；归档与绑定的互斥条件也在提交事务中重新检查。
 
 MCP `session_manage({sessionId, action})` 支持：`stop` 停止空闲进程但保留后续自动恢复能力；`unbind` 仅解绑当前对话；`archive` 停止并隐藏没有绑定的会话；`restore` 将归档恢复为可发现状态，随后用 `init` 上线。执行中、生成中、启动中或有在途请求的会话拒绝 stop/archive。有绑定的会话拒绝归档，其他对话的绑定不会被自动删除；任何操作都不删除 transcript。归档会话必须先 restore，不能通过执行工具绕过归档状态。
 
@@ -280,6 +286,8 @@ node tests/run-e2e.mjs --pi-version 0.99.2 --temp-dir /path/to/test-disk
 同日 `0.4.0` / Chappie `1.1.0-tunneldock.5` 验证记录：外部 runner 从干净上游应用补丁并构建同一 archive，Pi `0.99.1`、`0.99.2` 各通过 39 项测试，零失败、零跳过；20 项配置测试、TypeScript、Biome、ShellCheck、shell 语法及 diff 检查通过。覆盖新增项目 API、结构化错误、生命周期管理和副作用后断连不重放。代码提交为 `44df88e`，版本标签为 `v0.4.0`。
 
 2026-10-05 09:43（Asia/Shanghai）生产已部署 `.5`，Pi 保持 `0.99.2`。待部署 archive 在隔离环境额外通过 3 项真实 Pi 测试：打包后的 stdio MCP、工具/历史/空闲与重启恢复，以及实际 shell 副作用后断连不重放；生产安装的 30 个文件与该 archive 逐字节一致。重启后 broker 返回 `.5`，原有 25 个绑定、22 个托管会话及其 cwd/名称/归档状态均保留。doctor 的服务、broker、健康探针及 control-plane 轮询检查通过。部署时没有 managed Pi 在线，因此本次生产检查没有验证现场 Pi handshake；隔离测试不代替真实 ChatGPT 宿主端工具发现与调用的验收。
+
+同日 `.6` / `0.4.1` 验证记录：干净上游重建后，Pi `0.99.1`、`0.99.2` 各通过 44 项测试，零失败、零跳过；20 项配置测试、TypeScript、Biome、ShellCheck、shell 语法和 diff 检查通过。新增覆盖初始化快照并发/取消、失败写入的状态回退、旧 transcript 重建 metadata 后保持 ID 和历史、缺失目标清理，以及歧义/损坏扫描时保留绑定。用户对 `.5` 的现场复核确认 `/home/reyin` 下 write/read/edit/bash/文件导出执行链正常；`.6` 的改动针对剩余的会话一致性问题。
 
 ## 文件布局与许可
 

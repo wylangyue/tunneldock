@@ -204,7 +204,7 @@ TUNNELDOCK_FORCE_OTUNNEL_SOURCE=1 install_otunnel
             profile.write_text(f'control_plane:\n  api_key: "file:{key}"\nhealth:\n  listen_addr: "127.0.0.1:18081"\n')
             config.write_object(root / "config.json", {"autoCreate": {"cwd": directory}})
             config.write_object(root / "package.json", {
-                "version": "1.1.0-tunneldock.4", "tunneldock": {"chatScopedSessions": 1,
+                "version": "1.1.0-tunneldock.5", "tunneldock": {"chatScopedSessions": 1,
                 "runtimeHandshake": 1, "runtimeDiagnostics": 1, "ipcCapacity": 1}})
             script = '''source "$1"
 PROFILE_FILE="$2/profile.yaml"

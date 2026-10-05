@@ -8,10 +8,10 @@
 
 | 组件 | 默认版本 | 说明 |
 | --- | --- | --- |
-| TunnelDock | 0.3.0 | Linux CLI，增加托管运行时握手、诊断和 IPC 容量限制 |
+| TunnelDock | 0.4.0 | 增加 cwd 项目选择、结构化错误、会话生命周期和外部 E2E 入口 |
 | Node.js | 26.10.0 | 已有 Node >= 26 时保留现有版本 |
 | Pi coding agent | 0.99.2 | 已验证实际会话创建、历史恢复及空闲恢复 |
-| Chappie | 1.1.0-tunneldock.4 | 基于官方 1.1.0，支持 MCP 直接工具、离线发现和可选固定项目会话 |
+| Chappie | 1.1.0-tunneldock.5 | 基于官方 1.1.0，支持 MCP 直接工具、cwd 项目选择和会话管理 |
 | otunnel | 0.2.0 | 使用官方 Linux GNU release，运行失败时本机编译 |
 | pnpm | 12.4.1 | 仅在临时目录用于构建 Chappie |
 
@@ -65,7 +65,7 @@ configure-chappie-tunnel \
 1. 检查 Linux、systemd user bus 和版本参数，再准备基础工具、Python/PyYAML、Node、Pi。
 2. 下载 otunnel 预编译包并实际执行版本检查。下载、解压或运行失败时，使用 Rust stable、本机编译器和 CMake 从锁定 tag 编译。
 3. 拉取 Chappie v1.1.0，严格验证并应用补丁，按上游 frozen lockfile 安装构建依赖，执行 TypeScript 检查及 bundle 构建。
-4. 将构建产物以 `1.1.0-tunneldock.4` 安装为全局 broker；Pi 注册同一安装目录的扩展。
+4. 将构建产物以 `1.1.0-tunneldock.5` 安装为全局 broker；Pi 注册同一安装目录的扩展。
 5. 迁移旧配置、broker 状态和 MCP 启动命令，保留原始旧文件及会话 transcript。
 6. 安装 systemd unit 和命令入口，尝试启用 linger。
 
@@ -110,6 +110,22 @@ tunneldock version
 MCP 顶层注册 `read`、`bash`、`edit`、`write`，通过和 `call` 相同的 broker 路径执行，使用相同的 conversation metadata、默认绑定、显式目标、取消和会话恢复。`edit` 使用 `path` 和 `edits: [{oldText, newText}]`。其他原生工具或不同 agent 的参数格式仍通过 `tools` 获取定义，再用 `call`。原生工具目录与 MCP 顶层注册目录是两种目录，不能仅凭原生工具存在就假定 MCP 顶层可调用。
 
 MCP `sessions` 同时列出在线会话和保存的离线托管会话，包含 `online`、`managed`、`bindingCount`、cwd 和名称。查询离线会话不会启动 Pi；使用 `init({sessionId})` 恢复所选目标。
+
+多项目工作使用 cwd 选择，无需修改全局默认目录：
+
+```json
+{"cwd":"/srv/project-a","name":"main","createIfMissing":true}
+```
+
+上述参数传给 MCP `init`：cwd 必须是存在的绝对目录，符号链接按 realpath 归一化。先查找同目录、同名称的未归档托管会话；无匹配时仅在 `createIfMissing: true` 下创建，并发同项目创建共享同一个 ID。未指定名称时优先复用当前对话在该目录的绑定；否则多匹配返回 `ambiguous_project`，不猜测目标。显式 `sessionId` 配合 cwd/name 时必须匹配。项目查找失败不会回退到全局 cwd。项目名称是选择条件，不会把其他目录的同名会话合并。
+
+MCP `sessions` 支持 `cwd`、精确 `name`、`status`、`online`、`managed`、`includeArchived` 过滤，以及 `limit`（1..200，默认 50）和 `offset` 分页；返回 `total` 与 `nextOffset`。托管元数据记录 `createdAt`、`lastUsedAt` 和 `archived`，旧状态文件仍可读取，历史时间未知时不补造时间。
+
+MCP `session_manage({sessionId, action})` 支持：`stop` 停止空闲进程但保留后续自动恢复能力；`unbind` 仅解绑当前对话；`archive` 停止并隐藏没有绑定的会话；`restore` 将归档恢复为可发现状态，随后用 `init` 上线。执行中、生成中、启动中或有在途请求的会话拒绝 stop/archive。有绑定的会话拒绝归档，其他对话的绑定不会被自动删除；任何操作都不删除 transcript。归档会话必须先 restore，不能通过执行工具绕过归档状态。
+
+桥接错误保留 MCP `isError`，并在 `structuredContent.error` 中返回 `code`、`message`、`layer`、`execution`、`retryable`、`recovery`，以及可获得的 `sessionId`、`requestId`。`execution` 为 `not_started`、`completed` 或 `unknown`。协议和参数校验错误仍遵循 MCP SDK 的标准错误格式。异常的任意原始文本不被重新包装为对外诊断；未知错误提示查阅历史，避免泄露启动 stderr。
+
+离线访问自动恢复原会话；工具派发前目标连接不可用时，broker 最多恢复并重试一次。已经派发的请求在超时、取消或断连后不自动重放。宿主未暴露直接工具时，需要调用端改走 `call`，服务端无法替宿主注册工具；外部 E2E 客户端实现工具目录 fallback，以及 SDK 明确报告工具未注册时的一次 fallback，不会把参数校验错误或结果未知的写入当成可重试操作。
 
 上游默认会选择未绑定的在线会话；TunnelDock 为长期 VPS 使用保留以下语义：
 
@@ -248,9 +264,20 @@ CHAPPIE_SOURCE_DIR=/path/to/patched/chappie node --test tests/chappie.test.mjs t
 
 增加真实 Pi 集成测试时，设置 `CHAPPIE_PI_BIN` 为隔离安装的 Pi 可执行文件路径、`CHAPPIE_PACKAGE_DIR` 为该隔离环境里安装的 Chappie 打包产物目录，`CHAPPIE_PI_VERSION` 为期望运行的版本。不要直接用含有 Pi 开发依赖的 Chappie 源码目录充当扩展包，避免诊断错误引用开发依赖版本。分别使用 Pi 0.99.1/0.99.2 和同一 Chappie archive 可进行 A/B；真实测试验证 MCP 工具注册、四个直接工具、通用 call、工具定义、错误返回、显式目标、chat/history、文件导入导出及资源读取、空闲恢复、离线发现和 broker 重启恢复。其余回归涵盖独立对话、并发、固定项目共享、失败重试、取消、忙碌保护、握手不匹配、30 秒启动超时、诊断脱敏、IPC 预算及队列超限后的取消。源码 checkout 与构建包的 `package.json` 版本必须一致。设置 `CHAPPIE_CLI_BIN` 为构建包的 `chappie` 可执行文件路径，可额外验证打包后的诊断命令。启动超时测试需要约 30 秒。
 
+推荐使用独立 E2E runner，它自行获取上游、应用当前补丁、检查 TypeScript、构建 archive，并为两个 Pi 版本分别建立本地安装与私有 HOME/agent/tmp/npm 配置：
+
+```bash
+node tests/run-e2e.mjs
+node tests/run-e2e.mjs --pi-version 0.99.2 --temp-dir /path/to/test-disk
+```
+
+需要 Node >= 26、npm、git 和网络，不需要生产凭据。所有安装都在唯一临时目录，不执行全局安装、systemctl 或生产 broker 的停止操作。测试结束回收自己的进程和目录；可用 `--source DIR --package DIR --pi-bin FILE --pi-version VERSION` 复用隔离构建。`tests/mcp-client.mjs` 从 Pi 外部控制打包后的 stdio MCP，具有请求截止时间、取消和断连清理；测试覆盖 cwd 并发创建、歧义/错误目录、过滤分页、归档/恢复和实际 shell 写入后断连不重复执行。宿主工具目录与真实 tunnel 的验收仍需在实际 ChatGPT 连接中进行，不把隔离 stdio 测试当作宿主验收。
+
 部署后人工验证：新建 ChatGPT 对话 A/B，确认两个 session ID 不同；返回 A 确认恢复原 ID；执行 `tunneldock sessions` 查看绑定。真实 OpenAI control plane、Restricted API Key 和 ChatGPT 宿主对话行为需在实际部署中验证。
 
 2026-10-05 验证记录：20 项配置测试、26 项 broker/IPC 回归通过；Pi 0.99.1 和 0.99.2 分别通过真实 MCP 工具/文件/历史/恢复测试和打包后的 stdio MCP 测试。TypeScript、Biome、ShellCheck、shell 语法及 diff 检查通过。安装器从干净上游应用补丁后重建的 archive，与已测试 archive 的 30 个文件逐字节一致。生产环境已部署 Chappie `1.1.0-tunneldock.4`，Pi 保持 `0.99.2`；原有 25 个绑定、22 个托管会话保留，doctor 的服务、broker、健康探针及 control-plane 轮询检查通过。这些检查尚不代替 ChatGPT 宿主端实际工具发现和调用的验收。
+
+同日 `0.4.0` / Chappie `1.1.0-tunneldock.5` 验证记录：外部 runner 从干净上游应用补丁并构建同一 archive，Pi `0.99.1`、`0.99.2` 各通过 39 项测试，零失败、零跳过；20 项配置测试、TypeScript、Biome、ShellCheck、shell 语法及 diff 检查通过。覆盖新增项目 API、结构化错误、生命周期管理和副作用后断连不重放。此版本的代码与测试已纳入版本控制；本轮未部署 `.5`，生产仍为上述 `.4`，ChatGPT 宿主验收仍未执行。
 
 ## 文件布局与许可
 

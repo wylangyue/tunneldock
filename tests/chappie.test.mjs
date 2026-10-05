@@ -1,15 +1,15 @@
 // Run against a patched upstream checkout. All processes and files are temporary.
 import assert from "node:assert/strict";
-import { execFile, execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { createConnection } from "node:net";
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
-import { createInterface } from "node:readline";
+import { stdioClient } from "./mcp-client.mjs";
 import { test } from "node:test";
 
 const runFile = promisify(execFile);
@@ -157,6 +157,94 @@ test("project default shares one managed Pi and survives restart without replaci
   broker = await f.start();
   assert.equal((await broker.initialize("a", undefined, 3, signal())).session.id, sid);
   assert.equal((await broker.initialize("new", undefined, 4, signal())).session.id, other);
+});
+
+test("MCP cwd selection creates once, handles symlinks, validates targets and refuses ambiguous projects", async t => {
+  const f = await fixture(t);
+  const project = join(f.root, "project");
+  await mkdir(project);
+  const alias = join(f.root, "alias");
+  await symlink(project, alias);
+  const broker = await f.start();
+  const mcp = await mcpFixture(t, broker);
+  const missing = await mcp.call("init", { cwd: project });
+  assert.equal(missing.structuredContent.error.code, "project_not_found");
+  assert.equal(missing.structuredContent.error.execution, "not_started");
+  const selections = await Promise.all(Array.from({ length: 5 }, (_, i) => mcp.call("init", { cwd: i % 2 ? alias : project, name: "main", createIfMissing: true }, `project-${i}`)));
+  const ids = selections.map(result => JSON.parse(result.content[0].text).session.id);
+  assert.equal(new Set(ids).size, 1);
+  assert.equal((await f.starts()).length, 1);
+  assert.equal(JSON.parse(selections[0].content[0].text).session.cwd, project);
+  const mismatch = await mcp.call("init", { sessionId: ids[0], cwd: f.root });
+  assert.equal(mismatch.structuredContent.error.code, "project_mismatch");
+  const relative = await mcp.call("init", { cwd: "project", createIfMissing: true });
+  assert.equal(relative.structuredContent.error.code, "invalid_cwd");
+  const extra = await mcp.call("init", { cwd: project, name: "other", createIfMissing: true }, "extra");
+  assert.notEqual(JSON.parse(extra.content[0].text).session.id, ids[0]);
+  const ambiguous = await mcp.call("init", { cwd: project }, "fresh");
+  assert.equal(ambiguous.structuredContent.error.code, "ambiguous_project");
+  assert.equal(broker.binding("fresh"), undefined);
+});
+
+test("MCP discovery filters and pagination are passive; lifecycle protects bindings and survives restart", async t => {
+  const f = await fixture(t);
+  let broker = await f.start();
+  let mcp = await mcpFixture(t, broker);
+  const a = JSON.parse((await mcp.call("init", { cwd: f.root, name: "main", createIfMissing: true }, "a")).content[0].text).session.id;
+  await mcp.call("init", { cwd: f.root, name: "other", createIfMissing: true }, "b");
+  const page = JSON.parse((await mcp.call("sessions", { cwd: f.root, managed: true, limit: 1 }, "fresh")).content[0].text);
+  assert.equal(page.total, 2); assert.equal(page.sessions.length, 1); assert.equal(page.nextOffset, 1);
+  const named = JSON.parse((await mcp.call("sessions", { name: "main" }, "fresh")).content[0].text);
+  assert.equal(named.sessions[0].id, a); assert.ok(named.sessions[0].createdAt);
+  const bound = await mcp.call("session_manage", { sessionId: a, action: "archive" }, "a");
+  assert.equal(bound.structuredContent.error.code, "session_bound");
+  await mcp.call("session_manage", { sessionId: a, action: "stop" }, "a");
+  assert.equal(broker.listSessions(a).length, 0);
+  const offline = JSON.parse((await mcp.call("sessions", { online: false }, "a")).content[0].text);
+  assert.ok(offline.sessions.some(item => item.id === a));
+  assert.equal((await f.starts()).length, 2, "discovery must not resume the bound target");
+  await mcp.call("session_manage", { sessionId: a, action: "unbind" }, "a");
+  await mcp.call("session_manage", { sessionId: a, action: "archive" }, "a");
+  assert.equal(JSON.parse((await mcp.call("sessions", { sessionId: a }, "fresh")).content[0].text).total, 0);
+  await broker.close(); broker = await f.start(); mcp = await mcpFixture(t, broker);
+  const archived = JSON.parse((await mcp.call("sessions", { includeArchived: true, status: "archived" }, "fresh")).content[0].text);
+  assert.equal(archived.sessions[0].id, a);
+  assert.equal((await mcp.call("init", { sessionId: a })).structuredContent.error.code, "session_archived");
+  await mcp.call("session_manage", { sessionId: a, action: "restore" });
+  assert.equal(JSON.parse((await mcp.call("init", { sessionId: a })).content[0].text).session.id, a);
+});
+
+test("MCP structured failures retain correlation and classify in-flight disconnects as unknown", async t => {
+  const f = await fixture(t);
+  const broker = await f.start();
+  const mcp = await mcpFixture(t, broker);
+  const noMetadata = await mcp.request("tools/call", { name: "bash", arguments: { command: "ignored" } });
+  assert.equal(noMetadata.structuredContent.error.code, "missing_conversation_metadata");
+  assert.equal(noMetadata.structuredContent.error.execution, "not_started");
+  const missing = await mcp.call("init", { sessionId: "12345678-1234-4234-8234-123456789abc" });
+  assert.equal(missing.structuredContent.error.code, "session_not_found");
+  assert.ok(missing.structuredContent.error.requestId);
+  process.env.TEST_DISCONNECT = "1";
+  const disconnected = await mcp.call("bash", { command: "synthetic-unanswered-call" });
+  assert.equal(disconnected.structuredContent.error.code, "ipc_disconnected");
+  assert.equal(disconnected.structuredContent.error.execution, "unknown");
+  assert.equal(disconnected.structuredContent.error.retryable, false);
+  assert.equal(disconnected.structuredContent.error.sessionId, broker.binding("mcp-a"));
+  assert.ok(disconnected.structuredContent.error.requestId);
+  assert.equal((await f.starts()).length, 1, "an in-flight operation must not be replayed");
+});
+
+test("lifecycle requests cannot stop or archive actively generating sessions", async t => {
+  const f = await fixture(t);
+  process.env.TEST_STATUS = "generating";
+  const broker = await f.start();
+  const mcp = await mcpFixture(t, broker);
+  const id = JSON.parse((await mcp.call("init")).content[0].text).session.id;
+  for (const action of ["stop", "archive"]) {
+    const result = await mcp.call("session_manage", { sessionId: id, action });
+    assert.equal(result.structuredContent.error.code, "session_busy");
+  }
+  assert.equal(broker.listSessions(id).length, 1);
 });
 
 test("project defaults reject a saved ID belonging to another cwd", async t => {
@@ -411,39 +499,11 @@ test("packaged stdio MCP reaches real Pi and exposes offline recovery", {
   timeout: 30_000,
 }, async t => {
   const f = await fixture(t, { real: true, idleMinutes: 0.01 });
-  const child = spawn(process.env.CHAPPIE_CLI_BIN, [], { cwd: f.root, env: process.env, stdio: ["pipe", "pipe", "ignore"] });
-  const pending = new Map();
-  let nextId = 1;
-  const lines = createInterface({ input: child.stdout });
-  lines.on("line", line => {
-    const message = JSON.parse(line);
-    const completion = pending.get(message.id);
-    if (!completion) return;
-    pending.delete(message.id);
-    if (message.error) completion.reject(new Error(message.error.message));
-    else completion.resolve(message.result);
-  });
-  t.after(async () => {
-    child.stdin.end();
-    const timer = setTimeout(() => child.kill("SIGTERM"), 2000);
-    if (child.exitCode === null) await once(child, "exit");
-    clearTimeout(timer);
-    lines.close();
-  });
-  const send = message => child.stdin.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\n");
-  async function request(method, params) {
-    const id = nextId++;
-    const completion = Promise.withResolvers();
-    pending.set(id, completion);
-    send({ id, method, params });
-    return completion.promise;
-  }
-  await request("initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "td-stdio-test", version: "1.0.0" } });
-  send({ method: "notifications/initialized" });
-  const listed = await request("tools/list", {});
-  assert.ok(listed.tools.some(tool => tool.name === "bash"));
-  const call = (name, args = {}) => request("tools/call", { name, arguments: args, _meta: { "openai/session": "stdio-chat" } });
-  const bash = await call("bash", { command: "printf stdio-to-pi-ok" });
+  const client = await stdioClient({ command: process.env.CHAPPIE_CLI_BIN, cwd: f.root, env: process.env });
+  t.after(() => client.close());
+  assert.ok(client.tools.has("bash"));
+  const call = (name, args = {}) => client.call(name, args, "stdio-chat");
+  const bash = await client.native("bash", { command: "printf stdio-to-pi-ok" }, "stdio-chat");
   assert.equal(bash.isError, false);
   assert.match(bash.structuredContent.text, /stdio-to-pi-ok/);
   const sid = JSON.parse(bash.content[0].text).sessionId;
@@ -513,4 +573,22 @@ test("real Pi MCP tools, explicit routing, transcript and idle/restart recovery"
   assert.equal(restored.session.id, a.session.id);
   const after = await broker.history("real-a", undefined, { limit: 50 }, 6, signal());
   assert.ok(JSON.stringify(after).includes(message));
+});
+
+test("real stdio interruption after a shell mutation never replays it", {
+  skip: !process.env.CHAPPIE_PI_BIN || !process.env.CHAPPIE_CLI_BIN,
+  timeout: 30_000,
+}, async t => {
+  const f = await fixture(t, { real: true });
+  const client = await stdioClient({ command: process.env.CHAPPIE_CLI_BIN, cwd: f.root, env: process.env });
+  t.after(() => client.close());
+  const outcome = client.native("bash", { command: "printf once\\n >> once-marker; sleep 5" })
+    .then(value => ({ value }), error => ({ error }));
+  await until(async () => {
+    try { return (await readFile(join(f.root, "once-marker"), "utf8")).includes("once"); }
+    catch (error) { if (error.code === "ENOENT") return false; throw error; }
+  });
+  await client.close();
+  assert.equal((await outcome).error.execution, "unknown");
+  assert.equal((await readFile(join(f.root, "once-marker"), "utf8")).match(/once/g).length, 1);
 });

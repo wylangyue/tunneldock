@@ -15,7 +15,7 @@ const { values } = parseArgs({ options: {
   "temp-dir": { type: "string" }, help: { type: "boolean" },
 } });
 if (values.help) {
-  console.log("Usage: node tests/run-e2e.mjs [--pi-version 0.99.1,0.99.2] [--temp-dir DIR]\nReuse isolated builds: --source DIR --package DIR --pi-bin FILE --pi-version VERSION\nCreates a private HOME, agent directory, npm config and temp root. Never installs globally or stops production services.");
+  console.log("Usage: node tests/run-e2e.mjs [--pi-version 0.99.1,0.99.2] [--temp-dir DIR]\nReuse isolated builds: --source DIR --package DIR --pi-bin FILE --pi-version VERSION\nCreates a private HOME, agent directory, npm config and temp root. By default the temp root is under XDG_CACHE_HOME (or ~/.cache/tunneldock-e2e) to avoid small tmpfs /tmp mounts. Never installs globally or stops production services.");
   process.exit(0);
 }
 assert.equal(Boolean(values.source), Boolean(values.package), "--source and --package must be supplied together");
@@ -23,7 +23,10 @@ assert.ok(!values["pi-bin"] || values.package, "--pi-bin requires --source and -
 const versions = values["pi-version"].split(",");
 assert.ok(versions.every(version => /^\d+\.\d+\.\d+$/.test(version)), "invalid Pi version");
 assert.ok(!values["pi-bin"] || versions.length === 1, "one Pi version per --pi-bin");
-const root = await mkdtemp(join(resolve(values["temp-dir"] ?? tmpdir()), "td-e2e-"));
+const defaultTempBase = join(process.env.XDG_CACHE_HOME ?? join(process.env.HOME ?? tmpdir(), ".cache"), "tunneldock-e2e");
+const tempBase = resolve(values["temp-dir"] ?? process.env.TUNNELDOCK_E2E_TMPDIR ?? defaultTempBase);
+await mkdir(tempBase, { recursive: true });
+const root = await mkdtemp(join(tempBase, "td-e2e-"));
 const home = join(root, "home");
 await mkdir(home);
 const npmrc = join(root, "npmrc");

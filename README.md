@@ -277,7 +277,9 @@ node tests/run-e2e.mjs --pi-version 0.99.2 --temp-dir /path/to/test-disk
 
 2026-10-05 验证记录：20 项配置测试、26 项 broker/IPC 回归通过；Pi 0.99.1 和 0.99.2 分别通过真实 MCP 工具/文件/历史/恢复测试和打包后的 stdio MCP 测试。TypeScript、Biome、ShellCheck、shell 语法及 diff 检查通过。安装器从干净上游应用补丁后重建的 archive，与已测试 archive 的 30 个文件逐字节一致。生产环境已部署 Chappie `1.1.0-tunneldock.4`，Pi 保持 `0.99.2`；原有 25 个绑定、22 个托管会话保留，doctor 的服务、broker、健康探针及 control-plane 轮询检查通过。这些检查尚不代替 ChatGPT 宿主端实际工具发现和调用的验收。
 
-同日 `0.4.0` / Chappie `1.1.0-tunneldock.5` 验证记录：外部 runner 从干净上游应用补丁并构建同一 archive，Pi `0.99.1`、`0.99.2` 各通过 39 项测试，零失败、零跳过；20 项配置测试、TypeScript、Biome、ShellCheck、shell 语法及 diff 检查通过。覆盖新增项目 API、结构化错误、生命周期管理和副作用后断连不重放。此版本的代码与测试已纳入版本控制；本轮未部署 `.5`，生产仍为上述 `.4`，ChatGPT 宿主验收仍未执行。
+同日 `0.4.0` / Chappie `1.1.0-tunneldock.5` 验证记录：外部 runner 从干净上游应用补丁并构建同一 archive，Pi `0.99.1`、`0.99.2` 各通过 39 项测试，零失败、零跳过；20 项配置测试、TypeScript、Biome、ShellCheck、shell 语法及 diff 检查通过。覆盖新增项目 API、结构化错误、生命周期管理和副作用后断连不重放。代码提交为 `44df88e`，版本标签为 `v0.4.0`。
+
+2026-10-05 09:43（Asia/Shanghai）生产已部署 `.5`，Pi 保持 `0.99.2`。待部署 archive 在隔离环境额外通过 3 项真实 Pi 测试：打包后的 stdio MCP、工具/历史/空闲与重启恢复，以及实际 shell 副作用后断连不重放；生产安装的 30 个文件与该 archive 逐字节一致。重启后 broker 返回 `.5`，原有 25 个绑定、22 个托管会话及其 cwd/名称/归档状态均保留。doctor 的服务、broker、健康探针及 control-plane 轮询检查通过。部署时没有 managed Pi 在线，因此本次生产检查没有验证现场 Pi handshake；隔离测试不代替真实 ChatGPT 宿主端工具发现与调用的验收。
 
 ## 文件布局与许可
 

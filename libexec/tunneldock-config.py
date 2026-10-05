@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import uuid
 
 
 def read_object(path):
@@ -144,7 +145,7 @@ def main():
     if command == "migrate":
         migrate(*args)
     elif command in ("sessions-config", "sessions-default"):
-        path, cwd, prefix, idle = args
+        path, cwd, prefix, idle, *selection = args
         data = read_object(path)
         if command == "sessions-default" and "autoCreate" in data:
             return
@@ -153,6 +154,12 @@ def main():
         options = session_options(cwd or existing.get("cwd", str(Path.home())),
                                   prefix or existing.get("namePrefix", "chatgpt"),
                                   idle or existing.get("idleMinutes", 30))
+        sid = (selection[0] if selection else "") or existing.get("sessionId", "")
+        if sid and sid != "per-chat":
+            try:
+                options["sessionId"] = str(uuid.UUID(sid))
+            except (ValueError, AttributeError):
+                raise ValueError("project session ID must be a UUID") from None
         if data.get("connect"):
             raise ValueError("managed Pi sessions require a local broker; remove connect first")
         data["autoCreate"] = options
@@ -164,6 +171,12 @@ def main():
             raise ValueError("managed Pi session configuration is missing or incompatible")
         session_options(auto.get("cwd", ""), auto.get("namePrefix", "chatgpt"),
                         auto.get("idleMinutes", 30))
+        if "sessionId" in auto:
+            try:
+                if str(uuid.UUID(auto["sessionId"])) != auto["sessionId"]:
+                    raise ValueError()
+            except (ValueError, AttributeError, TypeError):
+                raise ValueError("project session ID must be a canonical UUID") from None
     elif command == "health-address":
         print(health_address(args[0]))
     elif command == "profile-info":

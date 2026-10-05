@@ -52,6 +52,19 @@ class ConfigTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(config.read_object(path), {"connect": "broker.local"})
 
+    def test_project_selection_survives_partial_updates_and_can_be_disabled(self):
+        path = self.root / "config.json"
+        sid = "12345678-1234-4234-8234-123456789abc"
+        self.assertEqual(self.invoke("sessions-config", path, self.root, "main", "30", sid).returncode, 0)
+        self.assertEqual(self.invoke("validate-sessions", path).returncode, 0)
+        self.assertEqual(self.invoke("sessions-config", path, "", "", "0", "").returncode, 0)
+        self.assertEqual(config.read_object(path)["autoCreate"]["sessionId"], sid)
+        before = config.read_object(path)
+        self.assertNotEqual(self.invoke("sessions-config", path, "", "", "", "not-a-uuid").returncode, 0)
+        self.assertEqual(config.read_object(path), before)
+        self.assertEqual(self.invoke("sessions-config", path, "", "", "", "per-chat").returncode, 0)
+        self.assertNotIn("sessionId", config.read_object(path)["autoCreate"])
+
     def test_migration_is_idempotent_and_preserves_legacy(self):
         agent, broker = self.root / "agent", self.root / "broker"
         old = {"bindings": {"chat": "sid"}, "managedSessions": {
@@ -191,7 +204,7 @@ TUNNELDOCK_FORCE_OTUNNEL_SOURCE=1 install_otunnel
             profile.write_text(f'control_plane:\n  api_key: "file:{key}"\nhealth:\n  listen_addr: "127.0.0.1:18081"\n')
             config.write_object(root / "config.json", {"autoCreate": {"cwd": directory}})
             config.write_object(root / "package.json", {
-                "version": "1.1.0-tunneldock.3", "tunneldock": {"chatScopedSessions": 1,
+                "version": "1.1.0-tunneldock.4", "tunneldock": {"chatScopedSessions": 1,
                 "runtimeHandshake": 1, "runtimeDiagnostics": 1, "ipcCapacity": 1}})
             script = '''source "$1"
 PROFILE_FILE="$2/profile.yaml"

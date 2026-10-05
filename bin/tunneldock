@@ -10,7 +10,7 @@ OTUNNEL_VERSION="${TUNNELDOCK_OTUNNEL_VERSION:-0.2.0}"
 SCRIPT_DIR="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 PATCH_FILE="$ROOT_DIR/patches/chappie-${CHAPPIE_VERSION}-chat-scoped-sessions.patch"
-PATCH_REVISION=3
+PATCH_REVISION=4
 CHAPPIE_BUILD_VERSION="$CHAPPIE_VERSION-tunneldock.$PATCH_REVISION"
 PNPM_VERSION=12.4.1
 CONFIG_HELPER="$ROOT_DIR/libexec/tunneldock-config.py"
@@ -229,7 +229,7 @@ build_chappie() (
 const fs = require("node:fs");
 const pkg = JSON.parse(fs.readFileSync("package.json"));
 pkg.version = process.argv[2];
-pkg.tunneldock = { chatScopedSessions: 1, runtimeHandshake: 1, runtimeDiagnostics: 1, ipcCapacity: 1 };
+pkg.tunneldock = { chatScopedSessions: 1, runtimeHandshake: 1, runtimeDiagnostics: 1, ipcCapacity: 1, directTools: 1, offlineDiscovery: 1, projectSessions: 1 };
 fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
 JS
 		# cli.js embeds package metadata, so rebuild with the local version.
@@ -256,7 +256,7 @@ install_chappie() {
 }
 
 write_session_config() {
-	config_tool sessions-config "$CHAPPIE_CONFIG" "${1:-}" "${2:-}" "${3:-}"
+	config_tool sessions-config "$CHAPPIE_CONFIG" "${1:-}" "${2:-}" "${3:-}" "${4:-}"
 	log "会话策略已写入 $CHAPPIE_CONFIG"
 }
 
@@ -405,17 +405,19 @@ EOF
 }
 
 configure_sessions() {
-	local cwd="" prefix="" idle=""
+	local cwd="" prefix="" idle="" selection=""
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 			--cwd) require_value "$@"; cwd="$2"; shift 2 ;;
 			--name-prefix) require_value "$@"; prefix="$2"; shift 2 ;;
 			--idle-minutes) require_value "$@"; idle="$2"; shift 2 ;;
-			-h|--help) echo "Usage: tunneldock sessions-config [--cwd PATH] [--name-prefix NAME] [--idle-minutes 0..1440]"; return ;;
+			--session-id) require_value "$@"; [[ -z "$selection" ]] || die "只能选择一种会话策略"; selection="$2"; shift 2 ;;
+			--per-chat) [[ -z "$selection" ]] || die "只能选择一种会话策略"; selection="per-chat"; shift ;;
+			-h|--help) echo "Usage: tunneldock sessions-config [--cwd PATH] [--name-prefix NAME] [--idle-minutes 0..1440] [--session-id UUID | --per-chat]"; return ;;
 			*) die "未知 sessions-config 参数: $1" ;;
 		esac
 	done
-	write_session_config "$cwd" "$prefix" "$idle"
+	write_session_config "$cwd" "$prefix" "$idle" "$selection"
 	if systemctl --user is-active --quiet chappie-tunnel.service 2>/dev/null; then
 		systemctl --user restart chappie-tunnel.service
 	fi
@@ -528,7 +530,7 @@ TunnelDock CLI v$VERSION
 Usage:
   tunneldock install
   tunneldock configure [--tunnel-id ID] [--api-key-file PATH] [--health-addr ADDR]
-  tunneldock sessions-config [--cwd PATH] [--name-prefix NAME] [--idle-minutes N]
+  tunneldock sessions-config [--cwd PATH] [--name-prefix NAME] [--idle-minutes N] [--session-id UUID | --per-chat]
   tunneldock start|stop|restart
   tunneldock status
   tunneldock doctor

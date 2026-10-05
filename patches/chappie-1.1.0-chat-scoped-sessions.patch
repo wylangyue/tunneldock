@@ -1,5 +1,5 @@
 diff --git a/src/broker.ts b/src/broker.ts
-index 698860b..bd419ca 100644
+index 698860b..b594aaa 100644
 --- a/src/broker.ts
 +++ b/src/broker.ts
 @@ -1,5 +1,8 @@
@@ -28,11 +28,12 @@ index 698860b..bd419ca 100644
  import type { ToolInput } from "./tools.ts";
  
  const observerInstructions =
-@@ -50,6 +60,23 @@ interface ChangeWaiter {
+@@ -50,6 +60,24 @@ interface ChangeWaiter {
  	onAbort(): void;
  }
  
 +interface AutoCreateOptions {
++	sessionId?: string;
 +	cwd: string;
 +	namePrefix: string;
 +	idleMs: number;
@@ -52,7 +53,7 @@ index 698860b..bd419ca 100644
  export interface Initialization {
  	sessionId: string;
  	instructions: string;
-@@ -92,6 +119,29 @@ export class Broker {
+@@ -92,6 +120,29 @@ export class Broker {
  	readonly #pending = new Map<number, PendingRequest>();
  	readonly #waiters = new Set<ChangeWaiter>();
  	readonly #cooldowns = new Map<string, number>();
@@ -82,7 +83,7 @@ index 698860b..bd419ca 100644
  	readonly #relays = new Map<
  		JsonLinePeer<SessionMessage, BrokerMessage>,
  		Map<number, AbortController>
-@@ -111,13 +161,28 @@ export class Broker {
+@@ -111,13 +162,31 @@ export class Broker {
  
  	async start(): Promise<void> {
  		this.#config = await readConfig(this.#directory);
@@ -95,6 +96,9 @@ index 698860b..bd419ca 100644
 +			if (this.#config.connect)
 +				throw new Error("autoCreate requires a local broker; remove connect");
 +			this.#autoCreate = {
++				...(options.sessionId
++					? { sessionId: options.sessionId.toLowerCase() }
++					: {}),
 +				cwd: await realpath(resolve(options.cwd ?? process.cwd())),
 +				namePrefix: options.namePrefix ?? "chatgpt",
 +				idleMs: (options.idleMinutes ?? 30) * 60_000,
@@ -112,7 +116,7 @@ index 698860b..bd419ca 100644
  		this.#cooldowns.clear();
  		for (const relays of this.#relays.values()) {
  			for (const controller of relays.values()) controller.abort(error);
-@@ -132,9 +197,100 @@ export class Broker {
+@@ -132,9 +201,100 @@ export class Broker {
  			waiter.reject(error);
  		}
  		this.#waiters.clear();
@@ -213,7 +217,7 @@ index 698860b..bd419ca 100644
  	}
  
  	listSessions(sessionId?: string): (SessionDescription & {
-@@ -144,7 +300,7 @@ export class Broker {
+@@ -144,7 +304,7 @@ export class Broker {
  		return [...this.#sessions.values()]
  			.filter(({ description }) => !sessionId || description.id === sessionId)
  			.map(({ description }) => ({
@@ -222,7 +226,40 @@ index 698860b..bd419ca 100644
  				bindingCount: counts.get(description.id) ?? 0,
  			}));
  	}
-@@ -305,7 +461,7 @@ export class Broker {
+@@ -153,6 +313,32 @@ export class Broker {
+ 		return this.#config.ask ?? true;
+ 	}
+ 
++	// Discovery includes persisted managed sessions without starting a process.
++	discoverSessions(sessionId?: string) {
++		const online = this.listSessions(sessionId).map((session) => ({
++			...session,
++			online: true,
++			managed: Boolean(this.#state.managedSession(session.id)),
++		}));
++		const counts = this.#state.bindingCounts();
++		const offline = this.#state
++			.managedSessions()
++			.filter(
++				([id]) => (!sessionId || id === sessionId) && !this.#sessions.has(id),
++			)
++			.map(([id, metadata]) => ({
++				id,
++				cwd: metadata.cwd,
++				...(metadata.name ? { name: metadata.name } : {}),
++				agent: "pi",
++				online: false,
++				managed: true,
++				status: this.#diagnostics.get(id)?.status ?? "offline",
++				bindingCount: counts.get(id) ?? 0,
++			}));
++		return [...online, ...offline];
++	}
++
+ 	binding(chatId: string): string | undefined {
+ 		return this.#state.binding(chatId);
+ 	}
+@@ -305,7 +491,7 @@ export class Broker {
  	) {
  		const target = sessionId ?? this.#state.binding(chatId);
  		if (!target) throw new Error("Specify a sessionId to read history");
@@ -231,7 +268,7 @@ index 698860b..bd419ca 100644
  		const result = await this.#request(
  			target,
  			(id) => ({
-@@ -327,7 +483,12 @@ export class Broker {
+@@ -327,7 +513,12 @@ export class Broker {
  		signal: AbortSignal,
  	): Promise<SessionInput[]> {
  		const target = sessionId ?? this.#state.binding(chatId);
@@ -245,7 +282,7 @@ index 698860b..bd419ca 100644
  		const result = await this.#request(
  			target,
  			(id) => ({ type: "inputs", id, sessionId: target }),
-@@ -501,7 +662,15 @@ export class Broker {
+@@ -501,7 +692,15 @@ export class Broker {
  		);
  		if ("inputs" in result)
  			await this.#ackInputs(request.sessionId, result.inputs, signal);
@@ -262,7 +299,7 @@ index 698860b..bd419ca 100644
  	}
  
  	async #receive(
-@@ -509,12 +678,31 @@ export class Broker {
+@@ -509,12 +708,31 @@ export class Broker {
  		message: SessionMessage,
  	): Promise<void> {
  		switch (message.type) {
@@ -294,7 +331,7 @@ index 698860b..bd419ca 100644
  				const controller = new AbortController();
  				relays.set(message.id, controller);
  				void this.request(message.request, controller.signal)
-@@ -551,12 +739,37 @@ export class Broker {
+@@ -551,12 +769,37 @@ export class Broker {
  					?.abort(new Error("Request cancelled"));
  				break;
  			case "sync": {
@@ -332,17 +369,26 @@ index 698860b..bd419ca 100644
  				await peer.send({
  					type: "synced",
  					id: message.id,
-@@ -607,6 +820,18 @@ export class Broker {
+@@ -607,6 +850,27 @@ export class Broker {
  			signal.throwIfAborted();
  			const boundId = this.#state.binding(chatId);
  			let target = requestedId ?? boundId;
 +			let created = false;
 +
 +			if (!target && this.#autoCreate) {
-+				target = randomUUID();
-+				const managed: ManagedSessionRecord = {
++				target = this.#autoCreate.sessionId ?? randomUUID();
++				const existing = this.#state.managedSession(target);
++				if (existing && (await realpath(existing.cwd)) !== this.#autoCreate.cwd)
++					throw new Error("Configured project session belongs to another cwd");
++				if (!existing && this.#sessions.has(target))
++					throw new Error(
++						"Configured project session is not a managed Pi session",
++					);
++				const managed: ManagedSessionRecord = existing ?? {
 +					cwd: this.#autoCreate.cwd,
-+					name: `${this.#autoCreate.namePrefix}-${target.slice(0, 8)}`,
++					name: this.#autoCreate.sessionId
++						? this.#autoCreate.namePrefix
++						: `${this.#autoCreate.namePrefix}-${target.slice(0, 8)}`,
 +				};
 +				await this.#state.createManagedBinding(chatId, target, managed);
 +				created = true;
@@ -351,7 +397,7 @@ index 698860b..bd419ca 100644
  			if (!target) {
  				const occupied = this.#state.bindingCounts();
  				target = [...this.#sessions.keys()].find((id) => !occupied.has(id));
-@@ -615,10 +840,12 @@ export class Broker {
+@@ -615,10 +879,12 @@ export class Broker {
  				await this.#waitForChange(signal);
  				continue;
  			}
@@ -366,7 +412,7 @@ index 698860b..bd419ca 100644
  					? await this.#join(chatId, target, requestId, signal, bindRequested)
  					: undefined;
  			return {
-@@ -633,6 +860,265 @@ export class Broker {
+@@ -633,6 +899,265 @@ export class Broker {
  		}
  	}
  
@@ -632,7 +678,7 @@ index 698860b..bd419ca 100644
  	async #join(
  		chatId: string,
  		sessionId: string,
-@@ -696,13 +1182,23 @@ export class Broker {
+@@ -696,13 +1221,23 @@ export class Broker {
  	async #inspect(
  		sessionId: string,
  		signal: AbortSignal,
@@ -657,7 +703,7 @@ index 698860b..bd419ca 100644
  		throw new Error("Session returned no inspection");
  	}
  
-@@ -738,6 +1234,12 @@ export class Broker {
+@@ -738,6 +1273,12 @@ export class Broker {
  			throw new Error(
  				`Session resource or target is unavailable: ${sessionId}`,
  			);
@@ -670,7 +716,7 @@ index 698860b..bd419ca 100644
  		const completion = Promise.withResolvers<SessionResult>();
  		const onAbort = (): void => {
  			const pending = this.#pending.get(id);
-@@ -766,7 +1268,9 @@ export class Broker {
+@@ -766,7 +1307,9 @@ export class Broker {
  			this.#finishRequest(id, pending);
  			pending.reject(error instanceof Error ? error : new Error(String(error)));
  		});
@@ -681,7 +727,7 @@ index 698860b..bd419ca 100644
  	}
  
  	#waitForChange(signal: AbortSignal): Promise<void> {
-@@ -819,6 +1323,11 @@ export class Broker {
+@@ -819,6 +1362,11 @@ export class Broker {
  	}
  
  	#removeSession(sessionId: string): void {
@@ -693,7 +739,7 @@ index 698860b..bd419ca 100644
  		this.#sessions.delete(sessionId);
  		this.#notifyChange();
  	}
-@@ -831,3 +1340,10 @@ function abortError(signal: AbortSignal): Error {
+@@ -831,3 +1379,10 @@ function abortError(signal: AbortSignal): Error {
  				typeof signal.reason === "string" ? signal.reason : "Request cancelled",
  			);
  }
@@ -739,16 +785,17 @@ index 8f53f20..5c37f9f 100644
  			positionals[0] === "codex" &&
  			positionals[1] === "setup" &&
 diff --git a/src/config.ts b/src/config.ts
-index ca374f2..8b63a2c 100644
+index ca374f2..966f005 100644
 --- a/src/config.ts
 +++ b/src/config.ts
-@@ -3,7 +3,17 @@ import { homedir } from "node:os";
+@@ -3,7 +3,18 @@ import { homedir } from "node:os";
  import { join } from "node:path";
  import * as z from "zod";
  
 +const autoCreateSchema = z.union([
 +	z.boolean(),
 +	z.object({
++		sessionId: z.uuid().optional(),
 +		cwd: z.string().min(1).optional(),
 +		namePrefix: z.string().min(1).optional(),
 +		idleMinutes: z.number().min(0).max(1440).optional(),
@@ -919,18 +966,23 @@ index 0000000..082ecda
 +		process.exitCode = 1;
 +}
 diff --git a/src/instructions.md b/src/instructions.md
-index 39c1d1d..cd30686 100644
+index 39c1d1d..8ff2060 100644
 --- a/src/instructions.md
 +++ b/src/instructions.md
-@@ -2,7 +2,7 @@ Chappie connects this conversation to coding-agent sessions across devices. Nati
+@@ -2,10 +2,12 @@ Chappie connects this conversation to coding-agent sessions across devices. Nati
  
  Select the intended session with init. Resume existing work with the task's sessionId, including from another chat or branch. Use sessions to identify the target by agent, device, directory, or name when its ID is unknown.
  
 -init sets this conversation's default target. A sessionId on another tool selects that operation's target. Read the file at globalAgents.path when returned, and follow initialization.instructions for participation in the task.
-+When autoCreate is configured, omitting sessionId in a fresh ChatGPT conversation creates a dedicated managed Pi session. Returning to the same conversation restores its saved session, including after broker restarts or idle shutdown. Explicit sessionId remains available to share or switch targets. Without autoCreate, Chappie selects an online unbound session. init sets this conversation's default target. A sessionId on another tool selects that operation's target. Read the file at globalAgents.path when returned, and follow initialization.instructions for participation in the task.
++When autoCreate is configured, a fresh conversation uses autoCreate.sessionId if configured, otherwise creates a dedicated managed Pi session. Existing conversation bindings take precedence over the configured project default. Returning to a conversation restores its saved session after broker restarts or idle shutdown. sessions includes saved offline managed sessions; init with their ID resumes them. Explicit sessionId remains available to share or switch targets. Without autoCreate, Chappie selects an online unbound session. init sets this conversation's default target. A sessionId on another tool selects that operation's target. Read the file at globalAgents.path when returned, and follow initialization.instructions for participation in the task.
  
  Read recent history to recover progress. Use tools to obtain native definitions before constructing call arguments.
  
++The MCP server exposes read, bash, edit and write as Pi proxies. They share the same session selection and recovery as call. edit takes path and edits: [{oldText, newText}]. Use call for other native tools or schemas; a native catalog entry alone does not register an MCP tool.
++
+ Use chat for progress, explanations, and completion in the selected session. Use transfer to exchange files and images with ChatGPT or another session. For questions in the agent interface, call its installed interactive tool.
+ 
+ Address new local user input delivered with results. Check delivered results before repeating interrupted operations. Use the session's persistent process facilities for long-running commands and read their saved output as needed.
 diff --git a/src/ipc.ts b/src/ipc.ts
 index 3717834..c27709d 100644
 --- a/src/ipc.ts
@@ -1267,7 +1319,7 @@ index 0000000..c662b37
 +	}
 +}
 diff --git a/src/server.ts b/src/server.ts
-index 7c68f2c..31bf78d 100644
+index 7c68f2c..dba4d7f 100644
 --- a/src/server.ts
 +++ b/src/server.ts
 @@ -92,7 +92,7 @@ export function createServer(broker: Broker): McpServer {
@@ -1275,10 +1327,98 @@ index 7c68f2c..31bf78d 100644
  					.optional()
  					.describe(
 -						"Session to select; omit to reuse the default or choose an online unbound session",
-+						"Session to select; omit to reuse the default, create a dedicated Pi session when autoCreate is enabled, or choose an online unbound session",
++						"Session to select or resume; omit to reuse the binding or configured project default, create a dedicated managed Pi session, or choose an online unbound session",
  					),
  			}),
  			annotations: toolAnnotations,
+@@ -322,6 +322,51 @@ export function createServer(broker: Broker): McpServer {
+ 		}),
+ 	);
+ 
++	// Fixed proxies are advertised before any Pi process has started. All calls
++	// use the same broker path as `call`, including binding, resume and cancellation.
++	const nativeInputs: Record<string, z.ZodObject> = {
++		read: z.object({
++			path: z.string(),
++			offset: z.number().optional(),
++			limit: z.number().optional(),
++		}),
++		bash: z.object({ command: z.string(), timeout: z.number().optional() }),
++		edit: z.object({
++			path: z.string(),
++			edits: z
++				.array(z.object({ oldText: z.string(), newText: z.string() }))
++				.min(1),
++		}),
++		write: z.object({ path: z.string(), content: z.string() }),
++	};
++	for (const [name, inputSchema] of Object.entries(nativeInputs)) {
++		server.registerTool(
++			name,
++			{
++				title: `Pi ${name}`,
++				description: `Run the Pi ${name} tool in the selected session. Use tools/call for other native schemas.`,
++				outputSchema,
++				inputSchema: inputSchema.extend({ sessionId: z.string().optional() }),
++				annotations: {
++					readOnlyHint: name === "read",
++					destructiveHint: name !== "read",
++					idempotentHint: name === "read",
++					openWorldHint: true,
++				},
++			},
++			handle(async ({ sessionId, ...args }, context) => {
++				const result = await broker.call(
++					context.chatId,
++					z.string().optional().parse(sessionId),
++					callsInput.parse([{ name, arguments: args }]),
++					context.mcpReq._meta?.["otunnel/requestId"],
++					context.mcpReq.signal,
++				);
++				return finishResult(broker, context, toolResult(result));
++			}),
++		);
++	}
++
+ 	server.registerTool(
+ 		"call",
+ 		{
+@@ -421,27 +466,27 @@ export function createServer(broker: Broker): McpServer {
+ 		{
+ 			title: "Sessions",
+ 			description:
+-				"List online Chappie sessions and this conversation's default target.",
++				"List online and saved offline managed sessions and this conversation's default target. Use init with a saved session ID to resume it.",
+ 			outputSchema,
+ 			inputSchema: z.object({
+ 				sessionId: z
+ 					.string()
+ 					.optional()
+-					.describe("Filter the online list to this session"),
++					.describe("Filter the session list to this session"),
+ 			}),
+ 			annotations: toolAnnotations,
+ 		},
+ 		handle(async (args, context) => {
+ 			const { chatId } = context;
+-			const inputs = await broker.inputs(
+-				chatId,
+-				args.sessionId,
+-				context.mcpReq.signal,
+-			);
++			const target = args.sessionId ?? broker.binding(chatId);
++			const inputs =
++				target && broker.listSessions(target).length
++					? await broker.inputs(chatId, target, context.mcpReq.signal)
++					: [];
+ 			const result = textResult(
+ 				{
+ 					binding: broker.binding(chatId) ?? null,
+-					sessions: broker.listSessions(args.sessionId),
++					sessions: broker.discoverSessions(args.sessionId),
+ 				},
+ 				inputs,
+ 			);
 diff --git a/src/session.ts b/src/session.ts
 index e1c0d54..c925f12 100644
 --- a/src/session.ts
@@ -1439,7 +1579,7 @@ index e1c0d54..c925f12 100644
  					return this.#sendError(
  						request.id,
 diff --git a/src/state.ts b/src/state.ts
-index 117c658..b88f26e 100644
+index 117c658..9e9852f 100644
 --- a/src/state.ts
 +++ b/src/state.ts
 @@ -3,8 +3,14 @@ import { join } from "node:path";
@@ -1484,12 +1624,16 @@ index 117c658..b88f26e 100644
  		for (const delivery of state.deliveries ?? []) {
  			if (delivery?.id) this.#deliveries.set(delivery.id, delivery);
  		}
-@@ -58,6 +77,20 @@ export class State {
+@@ -58,6 +77,24 @@ export class State {
  		return this.#save();
  	}
  
 +	managedSession(sessionId: string): ManagedSessionRecord | undefined {
 +		return this.#managedSessions.get(sessionId);
++	}
++
++	managedSessions(): [string, ManagedSessionRecord][] {
++		return [...this.#managedSessions];
 +	}
 +
 +	async createManagedBinding(
@@ -1505,7 +1649,7 @@ index 117c658..b88f26e 100644
  	deliveries(chatId: string): DeliveryRecord[] {
  		return [...this.#deliveries.values()].filter(
  			(delivery) => delivery.clientId === chatId,
-@@ -148,9 +181,19 @@ export class State {
+@@ -148,9 +185,19 @@ export class State {
  	#save(): Promise<void> {
  		const saved = this.#writes.then(async () => {
  			const bindings = Object.fromEntries(this.#bindings);
